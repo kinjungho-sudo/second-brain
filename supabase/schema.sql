@@ -398,3 +398,52 @@ grant execute on function public.sb_extract_links(text), public.sb_link_pattern(
   public.brain_invite(uuid, text, text), public.brain_revoke_invite(uuid), public.brain_my_invites(), public.brain_accept_invite(uuid),
   public.brain_set_member(uuid, uuid, text), public.brain_rename_preview(uuid), public.brain_rename_note(uuid, text, boolean),
   public.brain_rename_folder(uuid, text, text) to authenticated;
+
+-- ===== AI 에이전트 연결 (MCP 서버 supabase/functions/brain-mcp 가 사용) =====
+create table public.brain_agent_tokens (
+  id uuid primary key default gen_random_uuid(),
+  vault_id uuid not null references public.brain_vaults(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  name text not null check (length(btrim(name)) between 1 and 40),
+  token_hash text not null unique,      -- 원문은 저장하지 않는다 (sha256)
+  token_hint text not null,
+  created_at timestamptz not null default now(),
+  last_used_at timestamptz,
+  revoked_at timestamptz
+);
+create index brain_agent_tokens_vault on public.brain_agent_tokens (vault_id, user_id);
+alter table public.brain_agent_tokens enable row level security;
+create policy brain_agent_tokens_read on public.brain_agent_tokens for select to authenticated
+  using (user_id = auth.uid() or public.brain_role(vault_id) = 'owner');
+revoke all on public.brain_agent_tokens from anon;
+revoke insert, update on public.brain_agent_tokens from authenticated;
+
+alter table public.brain_notes add column if not exists updated_via text;      -- null = 사람(앱), 그 외 = 에이전트 이름
+alter table public.brain_revisions add column if not exists edited_via text;
+-- brain_notes_before / brain_notes_after 는 updated_via 를 반영하도록 갱신됨 (마이그레이션 brain_agent_access 참고):
+--   앱에서 사람이 고치면 updated_via 를 지우고, 이력에는 edited_via 를 함께 남긴다.
+
+create or replace function public.brain_create_agent_token(p_vault uuid, p_name text) returns text
+language plpgsql security definer set search_path = '' as $$
+declare v_token text;
+begin
+  if not public.brain_can_write(p_vault) then raise exception 'editor or owner only'; end if;
+  v_token := 'sbw_' || translate(encode(extensions.gen_random_bytes(32), 'base64'), '+/=', '-_');
+  insert into public.brain_agent_tokens (vault_id, user_id, name, token_hash, token_hint)
+    values (p_vault, auth.uid(), btrim(p_name), encode(extensions.digest(v_token, 'sha256'), 'hex'), right(v_token, 4));
+  return v_token;
+end $$;
+
+create or replace function public.brain_revoke_agent_token(p_token uuid) returns void
+language plpgsql security definer set search_path = '' as $$
+declare t record;
+begin
+  select * into t from public.brain_agent_tokens where id = p_token;
+  if not found or (t.user_id <> auth.uid() and public.brain_role(t.vault_id) is distinct from 'owner') then
+    raise exception 'forbidden';
+  end if;
+  update public.brain_agent_tokens set revoked_at = now() where id = p_token and revoked_at is null;
+end $$;
+
+-- 에이전트용 이름 변경: service_role(MCP 서버)만 실행
+-- (본문은 마이그레이션 brain_agent_access 의 brain_agent_rename_note 참고: brain_rename_note 와 같은 규칙 + updated_via 기록)
