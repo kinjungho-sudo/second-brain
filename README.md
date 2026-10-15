@@ -38,6 +38,29 @@ Obsidian 1.14.4를 REA로 분석해서 알아낸 **동작 원리와 구조**를 
 - 그래프에서 마지막으로 고친 사람별로 색을 나눠 봅니다.
 - 보관함(휴지통): 노트를 지우지 않고 보관하며 언제든 되돌릴 수 있습니다.
 
+## AI 에이전트로 LLM 위키 만들기
+
+Karpathy의 "LLM 위키" 방식으로 쓸 수 있습니다. 원본 자료를 넣으면 AI 에이전트가 정리된 위키 페이지를 만들고 계속 고칩니다.
+앱 안에 AI가 들어 있지 않습니다. **정호님이 쓰는 에이전트(Claude Code, Codex, Hermes 등)가 MCP로 보관함에 접속해** 읽고 씁니다.
+그래서 앱 쪽 API 비용이 들지 않고, 웹·PDF 읽기도 에이전트가 직접 합니다.
+
+1. 설정(또는 리본의 🤖) → **LLM 위키 시작하기**
+   규칙 노트 `AGENTS`, `index`, `log`와 `원본/`, `위키/` 폴더를 만듭니다. `AGENTS` 노트를 고치면 모든 에이전트의 규칙이 바뀝니다.
+2. 설정 → **에이전트 연결** → 열쇠 만들기
+   Claude Code, Codex, Hermes용 설정 문구가 나옵니다. 복사해서 붙이면 됩니다.
+3. (선택) `agents/second-brain-wiki/SKILL.md`를 에이전트의 스킬 폴더에 넣습니다. Claude Code라면 `~/.claude/skills/`입니다.
+   그러면 "이 글 위키에 넣어줘"라는 말만으로 정리 순서를 따릅니다.
+4. 에이전트에게 말합니다.
+   - 자료 넣기: "이 기사 위키에 넣어줘 https://…"
+   - 질문: "위키 보고 A사와 B사 차이 정리해줘"
+   - 점검: "위키 점검해줘"
+
+에이전트가 고친 내용은 실시간으로 앱에 나타납니다. 이력에는 "🤖 Claude Code"처럼 남고, 언제든 되돌릴 수 있습니다.
+열쇠는 보관함 하나와 만든 사람의 권한으로만 동작하며, 설정에서 언제든 취소할 수 있습니다.
+
+**MCP 도구:** `wiki_guide`, `list_notes`, `read_note`, `search_notes`, `write_note`, `rename_note`, `archive_note`, `recent_changes`, `find_problems`
+**서버:** `supabase/functions/brain-mcp` (Supabase Edge Function)
+
 ## Obsidian 구조와의 대응
 
 | Obsidian (분석 결과) | 이 앱 |
@@ -58,6 +81,8 @@ Obsidian 1.14.4를 REA로 분석해서 알아낸 **동작 원리와 구조**를 
 ├── render.js           읽기 보기 렌더러 (위키링크, 임베드, 콜아웃)
 ├── graph.js            그래프 뷰 (d3-force + canvas)
 ├── icons.js            아이콘
+├── wiki-rules.js       LLM 위키 기본 규칙 (AGENTS 노트의 처음 내용)
+├── agents/second-brain-wiki/SKILL.md   에이전트용 스킬
 ├── style.css           스타일 (어두운/밝은 테마)
 ├── config.js           Supabase 주소와 공개 키
 ├── vendor.js           외부 라이브러리 묶음 (supabase-js, CodeMirror 6, marked, DOMPurify, d3-force)
@@ -65,6 +90,7 @@ Obsidian 1.14.4를 REA로 분석해서 알아낸 **동작 원리와 구조**를 
 ├── vercel.json         보안 헤더 (CSP 등)
 └── supabase/
     ├── schema.sql              DB 스키마 (brain_ 보관함 구조)
+    ├── functions/brain-mcp/    AI 에이전트용 MCP 서버
     └── legacy-sb-schema.sql    이전 두 사람 전용 구조 (기록용)
 ```
 

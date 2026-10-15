@@ -1,15 +1,18 @@
 // Second Brain: Obsidian의 구조(볼트·링크 색인·백링크·그래프·탭 작업공간)를 Supabase 위에 재구성
 import { createClient } from './vendor.js';
-import { SUPABASE_URL, SUPABASE_KEY } from './config.js';
+import { SUPABASE_KEY } from './config.js';
 import { createEditor } from './editor.js';
 import { renderInto, headingsOf, tagsOf, stripCode, toggleTask, escapeHtml, WIKILINK_RE } from './render.js';
 import { createGraph } from './graph.js';
 import { icon } from './icons.js';
+import { DEFAULT_RULES } from './wiki-rules.js';
+import { SUPABASE_URL } from './config.js';
 
 // 공개 키(publishable)만 사용한다. 실제 접근 통제는 DB의 RLS가 담당한다.
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { flowType: 'pkce' } });
 
-const COLS = 'id,vault_id,title,folder,content,link_keys,version,created_by,updated_by,created_at,updated_at,archived_at';
+const COLS = 'id,vault_id,title,folder,content,link_keys,version,created_by,updated_by,updated_via,created_at,updated_at,archived_at';
+const MCP_URL = `${SUPABASE_URL}/functions/v1/brain-mcp`;
 const SAVE_DELAY_MS = 800;
 const $ = (id) => document.getElementById(id);
 const keyOf = (title) => String(title || '').trim().toLowerCase();
@@ -519,7 +522,8 @@ function syncOpenEditors(row, old) {
     tab.editor?.setText(row.content);
     if (tab.mode === 'preview') renderReading(tab);
   }
-  if (row.updated_by !== me()) notice(`${nameOf(row.updated_by)}님이 "${row.title}"을(를) 수정했습니다`, 2000);
+  if (row.updated_via) notice(`🤖 ${row.updated_via}(${nameOf(row.updated_by)})가 "${row.title}"을(를) 수정했습니다`, 2500);
+  else if (row.updated_by !== me()) notice(`${nameOf(row.updated_by)}님이 "${row.title}"을(를) 수정했습니다`, 2000);
 }
 
 // ---------- 저장 (version 비교로 동시 편집 충돌 감지) ----------
@@ -1558,7 +1562,7 @@ async function renderHistory() {
   const pane = $('pane-history');
   const id = activeNoteId();
   if (!id) return pane.replaceChildren(paneEmpty('열린 노트가 없습니다'));
-  const { data } = await sb.from('brain_revisions').select('id,version,title,content,edited_by,edited_at').eq('note_id', id).order('edited_at', { ascending: false }).limit(50);
+  const { data } = await sb.from('brain_revisions').select('id,version,title,content,edited_by,edited_via,edited_at').eq('note_id', id).order('edited_at', { ascending: false }).limit(50);
   if (activeNoteId() !== id) return;
   const n = store.notes.get(id);
   const list = el('div', { class: 'history-list' },
@@ -1567,6 +1571,7 @@ async function renderHistory() {
   for (const r of data || []) {
     list.append(el('div', { class: 'history-item', onclick: () => openRevision(r) },
       el('span', { class: 'history-author' + (r.edited_by === me() ? ' is-me' : ''), text: nameOf(r.edited_by) }),
+      r.edited_via ? el('span', { class: 'history-agent', title: 'AI 에이전트가 수정', text: `🤖 ${r.edited_via}` }) : null,
       el('span', { class: 'history-time', text: relTime(r.edited_at) }),
       el('span', { class: 'history-version muted', text: `v${r.version}` })));
   }
@@ -1701,8 +1706,10 @@ function renderFileTree() {
       },
       el('span', { class: 'tree-item-inner', text: n.title }),
       who ? el('span', { class: 'presence-dot', title: `${who}님이 보는 중`, text: who.slice(0, 1) }) : null,
-      n.updated_by !== me() && Date.now() - new Date(n.updated_at).getTime() < 86400000
-        ? el('span', { class: 'nav-file-tag', title: `${nameOf(n.updated_by)}님이 최근 수정`, text: nameOf(n.updated_by).slice(0, 1) }) : null);
+      n.updated_via && Date.now() - new Date(n.updated_at).getTime() < 86400000
+        ? el('span', { class: 'nav-file-tag is-agent', title: `🤖 ${n.updated_via}가 최근 수정`, text: '🤖' })
+        : n.updated_by !== me() && Date.now() - new Date(n.updated_at).getTime() < 86400000
+          ? el('span', { class: 'nav-file-tag', title: `${nameOf(n.updated_by)}님이 최근 수정`, text: nameOf(n.updated_by).slice(0, 1) }) : null);
       self.addEventListener('dragstart', (e) => {
         e.dataTransfer.setData('text/sb-note', n.id);
         e.dataTransfer.setData('text/plain', `[[${n.title}]]`);
@@ -1940,6 +1947,8 @@ const COMMANDS = [
   { id: 'theme', name: '어두운 / 밝은 테마 전환', run: () => toggleTheme() },
   { id: 'settings', name: '설정 열기', hotkey: 'Ctrl+,', run: () => openSettings() },
   { id: 'members', name: '멤버와 초대 관리', run: () => openMembers() },
+  { id: 'agents', name: 'AI 에이전트 연결 (Claude Code · Codex · Hermes)', run: () => openAgents() },
+  { id: 'wiki-setup', name: 'LLM 위키 시작하기 (규칙·index·log 만들기)', run: () => setupLlmWiki() },
   { id: 'switch-vault', name: '다른 보관함 열기 / 새 보관함 만들기', run: () => switchVault() },
   { id: 'logout', name: '로그아웃', run: () => logout() },
 ];
@@ -2034,6 +2043,9 @@ function openSettings() {
       row('보관함', `지금: ${store.vault.name} (${roleLabel(store.vault.role)})`, el('div', { class: 'setting-buttons' },
         el('button', { text: '멤버와 초대', onclick: () => openMembers() }),
         el('button', { text: '다른 보관함', onclick: () => switchVault() }))),
+      el('h3', { text: 'AI 에이전트 · LLM 위키' }),
+      row('에이전트 연결', 'Claude Code, Codex, Hermes 같은 AI 에이전트가 이 보관함을 읽고 쓰게 합니다', el('button', { class: 'mod-cta', text: '연결 관리', onclick: () => openAgents() })),
+      row('LLM 위키 시작하기', '에이전트용 규칙(AGENTS), index, log 노트와 원본/위키 폴더를 만듭니다', el('button', { text: '만들기', onclick: () => setupLlmWiki() })),
       row(store.user.email, null, el('button', { text: '로그아웃', onclick: () => logout() }))),
   });
 }
@@ -2154,6 +2166,94 @@ async function openMembers() {
         } }))].filter(Boolean));
   }
   draw();
+}
+
+// ---------- AI 에이전트 연결 (MCP) ----------
+function agentSetupGuide(token) {
+  const tk = token || '여기에_열쇠';
+  const block = (title, desc, code) => el('div', { class: 'agent-guide' },
+    el('div', { class: 'agent-guide-title', text: title }),
+    desc ? el('div', { class: 'muted small', text: desc }) : null,
+    el('div', { class: 'agent-code' },
+      el('pre', { text: code }),
+      el('button', { class: 'small-button', text: '복사', onclick: () => copyText(code) })));
+  return el('div', { class: 'agent-guides' },
+    block('Claude Code', '터미널에서 한 번 실행하세요.', `claude mcp add --transport http second-brain ${MCP_URL} --header "Authorization: Bearer ${tk}"`),
+    block('Codex', '~/.codex/config.toml 에 추가하세요.', `[mcp_servers.second-brain]\nurl = "${MCP_URL}"\nhttp_headers = { "Authorization" = "Bearer ${tk}" }`),
+    block('Hermes Agent', '~/.hermes/config.yaml 의 mcp_servers 에 추가하세요.', `mcp_servers:\n  second-brain:\n    url: "${MCP_URL}"\n    headers:\n      Authorization: "Bearer ${tk}"`),
+    block('그 밖의 MCP 앱 (Claude Desktop, Cursor 등)', 'mcpServers 설정에 추가하세요.', JSON.stringify({ mcpServers: { 'second-brain': { type: 'http', url: MCP_URL, headers: { Authorization: `Bearer ${tk}` } } } }, null, 2)),
+    el('div', { class: 'muted small', text: '연결한 뒤 에이전트에게 "second-brain의 wiki_guide를 읽고 이 자료를 위키에 넣어줘"처럼 말하면 됩니다. 설정 형식은 에이전트 버전에 따라 조금 다를 수 있습니다.' }));
+}
+
+async function openAgents() {
+  const body = el('div', { class: 'agents-modal' });
+  openModal({ title: `AI 에이전트 연결 · "${store.vault.name}"`, cls: 'mod-wide', content: body });
+
+  async function draw(newToken = null) {
+    const { data: tokens } = await sb.from('brain_agent_tokens').select('id,name,token_hint,user_id,created_at,last_used_at,revoked_at')
+      .eq('vault_id', store.vault.id).is('revoked_at', null).order('created_at', { ascending: false });
+    const name = el('input', { type: 'text', placeholder: '열쇠 이름 (예: Claude Code, Codex, Hermes)', maxlength: '40' });
+    const create = async () => {
+      const n = name.value.trim();
+      if (!n) return name.focus();
+      const { data, error } = await sb.rpc('brain_create_agent_token', { p_vault: store.vault.id, p_name: n });
+      if (error) return notice('열쇠를 만들지 못했습니다');
+      draw({ name: n, token: data });
+    };
+    name.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) create(); });
+
+    body.replaceChildren(...[
+      el('p', { class: 'muted small', text: '에이전트가 이 보관함의 노트를 읽고, 찾고, 쓰고, 링크를 정리할 수 있게 연결합니다. 에이전트가 고친 내용은 수정 이력에 🤖 표시로 남고 언제든 되돌릴 수 있습니다. 열쇠는 이 보관함에만, 만든 사람의 권한으로만 쓰입니다.' }),
+      newToken ? el('div', { class: 'agent-new-token' },
+        el('div', { class: 'agent-guide-title', text: `"${newToken.name}" 열쇠가 만들어졌습니다` }),
+        el('div', { class: 'warning-text', text: '⚠ 이 열쇠는 지금 한 번만 보여 줍니다. 아래 설정 중 쓰는 에이전트 것을 복사해 두세요.' }),
+        el('div', { class: 'agent-code' }, el('pre', { text: newToken.token }), el('button', { class: 'small-button', text: '열쇠 복사', onclick: () => copyText(newToken.token) })),
+        agentSetupGuide(newToken.token)) : null,
+      el('div', { class: 'members-section-title', text: '새 열쇠 만들기' }),
+      canWrite()
+        ? el('div', { class: 'invite-form' }, name, el('button', { class: 'mod-cta', text: '열쇠 만들기', onclick: create }))
+        : el('p', { class: 'muted small', text: '읽기 전용 멤버는 열쇠를 만들 수 없습니다.' }),
+      el('div', { class: 'members-section-title', text: `사용 중인 열쇠 ${tokens?.length || 0}개` }),
+      ...(tokens || []).map((t) => el('div', { class: 'member-row' },
+        el('span', { class: 'member-dot is-pending', text: '🤖' }),
+        el('div', { class: 'member-info' },
+          el('div', { class: 'member-name', text: `${t.name} · …${t.token_hint}` }),
+          el('div', { class: 'muted small', text: `${nameOf(t.user_id)} · ${relTime(t.created_at)} 만듦 · ${t.last_used_at ? `${relTime(t.last_used_at)} 사용` : '아직 안 씀'}` })),
+        (t.user_id === me() || isOwner()) ? el('button', { class: 'small-button', text: '취소', onclick: async () => {
+          if (!(await confirmModal({ title: '열쇠 취소', text: `"${t.name}" 열쇠를 취소할까요? 이 열쇠를 쓰는 에이전트는 바로 연결이 끊깁니다.`, okText: '취소하기', danger: true }))) return;
+          const { error } = await sb.rpc('brain_revoke_agent_token', { p_token: t.id });
+          if (error) return notice('취소하지 못했습니다');
+          draw();
+        } }) : null)),
+      !newToken ? el('details', { class: 'agent-help' }, el('summary', { text: '에이전트별 설정 방법 보기' }), agentSetupGuide(null)) : null,
+      el('div', { class: 'members-section-title', text: '연결 주소' }),
+      el('div', { class: 'agent-code' }, el('pre', { text: MCP_URL }), el('button', { class: 'small-button', text: '복사', onclick: () => copyText(MCP_URL) })),
+    ].filter(Boolean));
+  }
+  draw();
+}
+
+// 에이전트가 따를 규칙과 기본 페이지를 만든다 (이미 있으면 건드리지 않음)
+async function setupLlmWiki() {
+  if (!canWrite()) return notice('읽기 전용 보관함입니다');
+  const today = new Date().toISOString().slice(0, 10);
+  const pages = [
+    { title: 'AGENTS', folder: '', content: DEFAULT_RULES },
+    { title: 'index', folder: '', content: '# 위키 목록\n\n에이전트가 위키 페이지를 만들 때마다 여기에 분류별로 추가합니다.\n\n## 주제\n\n## 사람\n\n## 회사·조직\n\n## 개념\n' },
+    { title: 'log', folder: '', content: `# 작업 기록\n\n최신이 위에 옵니다.\n\n- ${today} · ${nameOf(me())} · LLM 위키 시작\n` },
+  ];
+  await Promise.all([ensureFolder('원본'), ensureFolder('위키')]);
+  let made = 0;
+  for (const p of pages) {
+    if (store.byKey.has(keyOf(p.title))) continue;
+    const { data, error } = await sb.from('brain_notes').insert({ vault_id: store.vault.id, ...p }).select(COLS).single();
+    if (!error) { applyRow(data); made++; }
+  }
+  scheduleRefresh();
+  const rules = store.byKey.get('agents');
+  if (rules) openNote(rules.id);
+  notice(made ? `규칙·index·log 노트 ${made}개와 원본/위키 폴더를 만들었습니다. 이제 에이전트를 연결하세요.` : '이미 준비되어 있습니다.', 4000);
+  if (made) noticeAction('에이전트를 연결할까요?', '연결 관리', () => openAgents());
 }
 
 // ---------- 사이드바 / 모바일 서랍 ----------
