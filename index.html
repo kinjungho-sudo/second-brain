@@ -14,19 +14,15 @@
     <div class="card">
       <div class="card-logo" data-icon="graph"></div>
       <h1>Second Brain</h1>
-      <p class="muted">정호 · 재한의 공유 노트</p>
+      <p class="muted">함께 쓰는 Obsidian식 노트</p>
+      <p class="card-desc">메모를 [[링크]]로 이어 지식망을 만들고,<br />초대한 사람과 실시간으로 함께 키웁니다.</p>
       <button id="btn-login" class="mod-cta">Google로 로그인</button>
     </div>
   </section>
 
-  <!-- 초대되지 않은 계정 -->
-  <section id="view-denied" class="center-view" hidden>
-    <div class="card">
-      <h1>접근 권한이 없습니다</h1>
-      <p><span id="denied-email"></span> 계정은 초대 목록에 없습니다.</p>
-      <p class="muted">초대받은 Google 계정으로 다시 로그인해 주세요.</p>
-      <button id="btn-logout-denied">로그아웃</button>
-    </div>
+  <!-- 보관함 고르기 (Obsidian의 보관함 관리 화면) -->
+  <section id="view-vaults" class="center-view" hidden>
+    <div class="card vault-picker" id="vault-picker"></div>
   </section>
 
   <!-- 메인 -->
@@ -43,6 +39,7 @@
         </div>
         <div class="ribbon-actions ribbon-bottom">
           <button class="clickable-icon" data-cmd="theme" data-icon="moon" aria-label="테마 전환"></button>
+          <button class="clickable-icon" data-cmd="members" data-icon="users" aria-label="멤버와 초대"></button>
           <button class="clickable-icon" data-cmd="settings" data-icon="settings" aria-label="설정 (Ctrl+,)"></button>
           <button class="clickable-icon" data-cmd="logout" data-icon="logout" aria-label="로그아웃"></button>
         </div>
@@ -76,6 +73,7 @@
         <div class="pane" id="pane-tags" hidden>
           <div class="tag-pane" id="tag-list"></div>
         </div>
+        <div class="vault-switcher" id="vault-switcher"></div>
       </aside>
       <div class="resize-handle" id="resize-left"></div>
 

@@ -9,7 +9,7 @@ import { icon } from './icons.js';
 // 공개 키(publishable)만 사용한다. 실제 접근 통제는 DB의 RLS가 담당한다.
 const sb = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { flowType: 'pkce' } });
 
-const COLS = 'id,title,folder,content,link_keys,version,created_by,updated_by,created_at,updated_at,archived_at';
+const COLS = 'id,vault_id,title,folder,content,link_keys,version,created_by,updated_by,created_at,updated_at,archived_at';
 const SAVE_DELAY_MS = 800;
 const $ = (id) => document.getElementById(id);
 const keyOf = (title) => String(title || '').trim().toLowerCase();
@@ -45,20 +45,29 @@ function saveSettings() { savePref('sb.settings', settings); }
 // ---------- 상태 ----------
 const store = {
   user: null,
-  members: new Map(),      // user_id -> display_name
+  profileName: '',
+  vault: null,             // { id, name, role }
+  vaults: [],              // 내가 속한 보관함들
+  invites: [],             // 나에게 온 초대
+  members: new Map(),      // user_id -> { name, email, role, color }
   notes: new Map(),        // id -> row
   byKey: new Map(),        // 소문자 제목 -> row
-  folders: new Set(),      // sb_folders
-  recent: loadPref('sb.recent', []),
+  folders: new Set(),      // brain_folders
+  recent: [],
 };
+// 보관함마다 따로 저장하는 화면 상태
+const vkey = (k) => `${k}.${store.vault?.id}`;
+const MEMBER_COLORS = ['#a68af9', '#4cc2ad', '#f0a35e', '#e86f8f', '#6aa8f0', '#c7c85a', '#9cd67a', '#d58be0'];
 const edits = new Map();   // note id -> { text, dirty, timer, saving, lastSent, conflict }
 const metaCache = new Map();
 let tabs = [];
 let activeTab = null;
-let expanded = new Set(loadPref('sb.expanded', []));
+let expanded = new Set();
 let others = [];           // presence: [{ user_id, name, note }]
 
-const nameOf = (uid) => store.members.get(uid) || '알 수 없음';
+const nameOf = (uid) => store.members.get(uid)?.name || '알 수 없음';
+const canWrite = () => store.vault?.role === 'owner' || store.vault?.role === 'editor';
+const isOwner = () => store.vault?.role === 'owner';
 const me = () => store.user?.id;
 
 function textOf(id) {
@@ -101,7 +110,7 @@ function allTags() {
 
 function touchRecent(id) {
   store.recent = [id, ...store.recent.filter((x) => x !== id)].slice(0, 30);
-  savePref('sb.recent', store.recent);
+  savePref(vkey('sb.recent'), store.recent);
 }
 
 // ---------- DOM 도우미 ----------
@@ -128,6 +137,14 @@ function notice(msg, ms = 3000) {
   const n = el('div', { class: 'notice', text: msg, onclick: () => n.remove() });
   $('notice-container').append(n);
   setTimeout(() => n.remove(), ms);
+}
+
+function noticeAction(msg, label, action) {
+  const n = el('div', { class: 'notice notice-action' },
+    el('span', { text: msg }),
+    el('button', { class: 'mod-cta', text: label, onclick: (e) => { e.stopPropagation(); n.remove(); action(); } }),
+    el('button', { class: 'clickable-icon', html: icon('x', 14), onclick: (e) => { e.stopPropagation(); n.remove(); } }));
+  $('notice-container').append(n);
 }
 
 function fmtTime(iso) {
@@ -324,32 +341,110 @@ async function boot() {
 }
 
 function showView(id) {
-  for (const v of ['view-login', 'view-denied', 'view-app']) $(v).hidden = v !== id;
+  for (const v of ['view-login', 'view-vaults', 'view-app']) $(v).hidden = v !== id;
 }
 
 let initialized = false;
 async function onSession(session) {
   store.user = session?.user || null;
   if (!store.user) return showView('view-login');
-  // 초대 목록 + Google 인증 계정이면 회원으로 등록된다 (DB 함수가 판단)
-  const { data: ok, error } = await sb.rpc('sb_claim_membership');
-  if (error || !ok) {
-    $('denied-email').textContent = store.user.email || '';
-    return showView('view-denied');
+  store.profileName = (await sb.rpc('brain_ensure_profile')).data || store.user.email;
+  await loadVaults();
+  const wanted = loadPref('sb.vault', null);
+  const vault = store.vaults.find((v) => v.id === wanted) || (store.vaults.length === 1 && !store.invites.length ? store.vaults[0] : null);
+  if (!vault) return showVaultPicker();
+  await openVault(vault);
+}
+
+async function loadVaults() {
+  const [vaultsRes, rolesRes, invitesRes] = await Promise.all([
+    sb.from('brain_vaults').select('id,name,created_at').is('archived_at', null).order('created_at'),
+    sb.from('brain_members').select('vault_id,role').eq('user_id', store.user.id).is('removed_at', null),
+    sb.rpc('brain_my_invites'),
+  ]);
+  const roles = new Map((rolesRes.data || []).map((r) => [r.vault_id, r.role]));
+  store.vaults = (vaultsRes.data || []).map((v) => ({ ...v, role: roles.get(v.id) || 'viewer' }));
+  store.invites = invitesRes.data || [];
+}
+
+// Obsidian의 보관함 선택 화면: 내 보관함 열기 / 받은 초대 수락 / 새 보관함 만들기
+function showVaultPicker() {
+  showView('view-vaults');
+  const box = $('vault-picker');
+  const input = el('input', { type: 'text', placeholder: '새 보관함 이름', maxlength: '80' });
+  const create = async () => {
+    const name = input.value.trim();
+    if (!name) return input.focus();
+    const { data, error } = await sb.rpc('brain_create_vault', { p_name: name });
+    if (error) return notice('보관함을 만들지 못했습니다');
+    await loadVaults();
+    openVault(store.vaults.find((v) => v.id === data));
+  };
+  input.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) create(); });
+  box.replaceChildren(...[
+    el('div', { class: 'vault-picker-header' },
+      el('div', { class: 'vault-picker-logo', html: icon('graph', 36) }),
+      el('h1', { text: 'Second Brain' }),
+      el('p', { class: 'muted', text: `${store.profileName}님, 열 보관함을 고르세요` })),
+    store.invites.length ? el('div', { class: 'vault-picker-section' },
+      el('div', { class: 'vault-picker-section-title', text: '받은 초대' }),
+      store.invites.map((inv) => el('div', { class: 'vault-picker-item' },
+        el('div', {}, el('div', { class: 'vault-picker-name', text: inv.vault_name }), el('div', { class: 'muted small', text: `${inv.invited_by_name}님의 초대 · ${roleLabel(inv.role)}` })),
+        el('button', { class: 'mod-cta', text: '수락하고 열기', onclick: async () => {
+          const { data, error } = await sb.rpc('brain_accept_invite', { p_invite: inv.invite_id });
+          if (error) return notice('초대를 수락하지 못했습니다');
+          await loadVaults();
+          openVault(store.vaults.find((v) => v.id === data));
+        } })))) : null,
+    store.vaults.length ? el('div', { class: 'vault-picker-section' },
+      el('div', { class: 'vault-picker-section-title', text: '내 보관함' }),
+      store.vaults.map((v) => el('div', { class: 'vault-picker-item is-clickable', onclick: () => openVault(v) },
+        el('div', {}, el('div', { class: 'vault-picker-name', text: v.name }), el('div', { class: 'muted small', text: roleLabel(v.role) })),
+        el('span', { class: 'muted', html: icon('chevron-right', 16) })))) : null,
+    el('div', { class: 'vault-picker-section' },
+      el('div', { class: 'vault-picker-section-title', text: '새 보관함 만들기' }),
+      el('div', { class: 'vault-picker-create' }, input, el('button', { class: 'mod-cta', text: '만들기', onclick: create })),
+      el('div', { class: 'muted small', text: '만든 뒤 설정에서 이메일로 다른 사람을 초대할 수 있습니다.' })),
+    el('div', { class: 'vault-picker-footer' },
+      el('span', { class: 'muted small', text: store.user.email }),
+      initialized && store.vault ? el('button', { text: `"${store.vault.name}"(으)로 돌아가기`, onclick: () => showView('view-app') }) : null,
+      el('button', { text: '로그아웃', onclick: () => logout() }))].filter(Boolean));
+}
+
+const roleLabel = (r) => ({ owner: '소유자', editor: '편집자', viewer: '읽기 전용' }[r] || r);
+
+async function openVault(vault) {
+  if (!vault) return showVaultPicker();
+  if (initialized && store.vault?.id !== vault.id) {
+    // 다른 보관함으로 바꿀 때는 화면을 처음부터 다시 그린다
+    savePref('sb.vault', vault.id);
+    await flushAll();
+    location.hash = '';
+    location.reload();
+    return;
   }
+  store.vault = vault;
+  savePref('sb.vault', vault.id);
+  store.recent = loadPref(vkey('sb.recent'), []);
+  expanded = new Set(loadPref(vkey('sb.expanded'), []));
   showView('view-app');
   if (initialized) return;
   initialized = true;
+  document.title = `${vault.name} - Second Brain`;
+  document.body.classList.toggle('is-readonly', !canWrite());
   setupStaticUI();
+  renderVaultSwitcher();
   await Promise.all([loadMembers(), loadAll()]);
   subscribeRealtime();
   setupPresence();
   restoreWorkspace();
+  for (const inv of store.invites) {
+    noticeAction(`${inv.invited_by_name}님이 "${inv.vault_name}" 보관함에 초대했습니다`, '열기', () => showVaultPicker());
+  }
 }
 
 $('btn-login').onclick = () =>
   sb.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: location.origin + location.pathname } });
-$('btn-logout-denied').onclick = () => logout();
 
 async function logout() {
   await flushAll();
@@ -360,14 +455,22 @@ async function logout() {
 
 // ---------- 데이터 ----------
 async function loadMembers() {
-  const { data } = await sb.from('sb_members').select('user_id, display_name');
-  store.members = new Map((data || []).map((m) => [m.user_id, m.display_name]));
+  const { data } = await sb.rpc('brain_vault_members', { p_vault: store.vault.id });
+  store.members = new Map((data || []).map((m, i) => [m.user_id, { name: m.display_name, email: m.email, role: m.role, color: MEMBER_COLORS[i % MEMBER_COLORS.length] }]));
+  const mine = store.members.get(me());
+  if (mine && mine.role !== store.vault.role) {
+    store.vault.role = mine.role;
+    document.body.classList.toggle('is-readonly', !canWrite());
+    for (const t of tabs) t.editor?.setEditable(canWrite());
+  }
+  if (!mine) { notice('이 보관함에서 나가게 되었습니다'); localStorage.removeItem('sb.vault'); setTimeout(() => location.reload(), 1500); }
+  if (initialized) renderVaultSwitcher();
 }
 
 async function loadAll() {
   const [notesRes, foldersRes] = await Promise.all([
-    sb.from('sb_notes').select(COLS).is('archived_at', null),
-    sb.from('sb_folders').select('path').is('hidden_at', null),
+    sb.from('brain_notes').select(COLS).eq('vault_id', store.vault.id).is('archived_at', null),
+    sb.from('brain_folders').select('path').eq('vault_id', store.vault.id).is('hidden_at', null),
   ]);
   if (notesRes.error) { notice('노트를 불러오지 못했습니다'); return; }
   const seen = new Set();
@@ -441,7 +544,7 @@ async function save(id, { force = false } = {}) {
   const text = e.text;
   e.lastSent = text;
   setSaveStatus('저장 중…');
-  let q = sb.from('sb_notes').update({ content: text }).eq('id', id);
+  let q = sb.from('brain_notes').update({ content: text }).eq('id', id);
   if (!force) q = q.eq('version', n.version);
   const { data, error } = await q.select(COLS);
   e.saving = false;
@@ -451,7 +554,7 @@ async function save(id, { force = false } = {}) {
     return;
   }
   if (!data.length) {
-    const { data: latest } = await sb.from('sb_notes').select(COLS).eq('id', id).single();
+    const { data: latest } = await sb.from('brain_notes').select(COLS).eq('id', id).single();
     if (latest) showConflict(latest);
     return;
   }
@@ -521,7 +624,7 @@ async function updateNoteContent(id, text) {
     return true;
   }
   const n = store.notes.get(id);
-  const { data } = await sb.from('sb_notes').update({ content: text }).eq('id', id).eq('version', n.version).select(COLS);
+  const { data } = await sb.from('brain_notes').update({ content: text }).eq('id', id).eq('version', n.version).select(COLS);
   if (!data?.length) { notice('다른 사람이 먼저 수정해서 반영하지 못했습니다. 다시 시도해 주세요.'); return false; }
   applyRow(data[0]);
   return true;
@@ -548,7 +651,8 @@ function defaultFolder() {
 
 async function createNote({ title = '', folder = defaultFolder(), content = '', newTab = false, focusTitle = !title } = {}) {
   const t = uniqueTitle(title.trim() || '제목 없음');
-  const { data, error } = await sb.from('sb_notes').insert({ title: t, folder, content }).select(COLS).single();
+  if (!canWrite()) { notice('읽기 전용 보관함입니다'); return null; }
+  const { data, error } = await sb.from('brain_notes').insert({ vault_id: store.vault.id, title: t, folder, content }).select(COLS).single();
   if (error) { notice('노트를 만들지 못했습니다'); return null; }
   applyRow(data);
   if (folder) revealFolder(folder);
@@ -581,7 +685,7 @@ async function renameNote(id, newTitle) {
   const linked = [...store.notes.values()].some((o) => o.id !== id && metaOf(o.id).keys.has(oldKey));
   let links = 0, files = 0;
   if (linked) {
-    const { data: impact } = await sb.rpc('sb_rename_preview', { p_note: id });
+    const { data: impact } = await sb.rpc('brain_rename_preview', { p_note: id });
     links = impact?.[0]?.link_count || 0;
     files = impact?.[0]?.note_count || 0;
   }
@@ -591,7 +695,7 @@ async function renameNote(id, newTitle) {
     else if (settings.alwaysUpdateLinks === 'never') updateLinks = false;
     else updateLinks = await askRenameChoice(n.title, newTitle, links, files);
   }
-  const { data, error } = await sb.rpc('sb_rename_note', { p_note: id, p_new_title: newTitle, p_update_links: updateLinks });
+  const { data, error } = await sb.rpc('brain_rename_note', { p_note: id, p_new_title: newTitle, p_update_links: updateLinks });
   if (error) { notice('이름을 바꾸지 못했습니다'); return false; }
   if (data?.links) notice(`노트 ${data.notes}개의 링크 ${data.links}개를 업데이트했습니다`);
   await loadAll();
@@ -621,7 +725,7 @@ async function moveNote(id, folder) {
   const n = store.notes.get(id);
   if (!n || n.folder === folder) return;
   await flushAll();
-  const { data, error } = await sb.from('sb_notes').update({ folder }).eq('id', id).select(COLS);
+  const { data, error } = await sb.from('brain_notes').update({ folder }).eq('id', id).select(COLS);
   if (error || !data?.length) { notice('이동하지 못했습니다'); return; }
   applyRow(data[0], { own: true });
   if (folder) { revealFolder(folder); if (!store.folders.has(folder)) ensureFolder(folder); }
@@ -634,13 +738,13 @@ async function archiveNote(id) {
   const ok = await confirmModal({ title: '노트 보관', text: `"${n.title}" 노트를 보관함으로 옮길까요? 보관함에서 언제든 되돌릴 수 있습니다.`, okText: '보관', danger: true });
   if (!ok) return;
   await flushAll();
-  const { error } = await sb.from('sb_notes').update({ archived_at: new Date().toISOString() }).eq('id', id);
+  const { error } = await sb.from('brain_notes').update({ archived_at: new Date().toISOString() }).eq('id', id);
   if (error) return notice('보관하지 못했습니다');
   removeNote(id);
 }
 
 async function openArchiveList() {
-  const { data } = await sb.from('sb_notes').select('id,title,folder,archived_at,updated_by').not('archived_at', 'is', null).order('archived_at', { ascending: false }).limit(200);
+  const { data } = await sb.from('brain_notes').select('id,title,folder,archived_at,updated_by').eq('vault_id', store.vault.id).not('archived_at', 'is', null).order('archived_at', { ascending: false }).limit(200);
   const list = el('div', { class: 'archive-list' });
   if (!data?.length) list.append(el('div', { class: 'pane-empty', text: '보관된 노트가 없습니다' }));
   for (const r of data || []) {
@@ -651,7 +755,7 @@ async function openArchiveList() {
         onclick: async () => {
           let title = r.title;
           if (store.byKey.has(keyOf(title))) title = uniqueTitle(title);
-          const { data: d, error } = await sb.from('sb_notes').update({ archived_at: null, title }).eq('id', r.id).select(COLS);
+          const { data: d, error } = await sb.from('brain_notes').update({ archived_at: null, title }).eq('id', r.id).select(COLS);
           if (error || !d?.length) return notice('되돌리지 못했습니다');
           applyRow(d[0]);
           row.remove();
@@ -680,7 +784,7 @@ function allFolders() {
 
 async function ensureFolder(path) {
   if (!path || store.folders.has(path)) return true;
-  const { error } = await sb.from('sb_folders').upsert({ path, hidden_at: null });
+  const { error } = await sb.from('brain_folders').upsert({ vault_id: store.vault.id, path, hidden_at: null }, { onConflict: 'vault_id,path' });
   if (error) { notice('폴더를 만들지 못했습니다'); return false; }
   store.folders.add(path);
   return true;
@@ -704,7 +808,7 @@ async function renameFolder(path, newPath) {
   }
   if (allFolders().includes(newPath)) return notice('같은 이름의 폴더가 이미 있습니다');
   await flushAll();
-  const { error } = await sb.rpc('sb_rename_folder', { p_old: path, p_new: newPath });
+  const { error } = await sb.rpc('brain_rename_folder', { p_vault: store.vault.id, p_old: path, p_new: newPath });
   if (error) return notice('폴더 이름을 바꾸지 못했습니다');
   if (expanded.has(path)) { expanded.delete(path); expanded.add(newPath); }
   await reloadFolders();
@@ -712,7 +816,7 @@ async function renameFolder(path, newPath) {
 }
 
 async function reloadFolders() {
-  const { data } = await sb.from('sb_folders').select('path').is('hidden_at', null);
+  const { data } = await sb.from('brain_folders').select('path').eq('vault_id', store.vault.id).is('hidden_at', null);
   store.folders = new Set((data || []).map((f) => f.path));
 }
 
@@ -721,7 +825,7 @@ async function removeFolder(path) {
   if (inside) return notice('폴더 안에 노트가 있으면 지울 수 없습니다. 노트를 먼저 옮기거나 보관해 주세요.');
   const now = new Date().toISOString();
   const subs = allFolders().filter((f) => f === path || f.startsWith(path + '/'));
-  const { error } = await sb.from('sb_folders').update({ hidden_at: now }).in('path', subs);
+  const { error } = await sb.from('brain_folders').update({ hidden_at: now }).eq('vault_id', store.vault.id).in('path', subs);
   if (error) return notice('폴더를 지우지 못했습니다');
   await reloadFolders();
   scheduleRefresh();
@@ -730,7 +834,7 @@ async function removeFolder(path) {
 function revealFolder(path) {
   const parts = path.split('/');
   for (let i = 1; i <= parts.length; i++) expanded.add(parts.slice(0, i).join('/'));
-  savePref('sb.expanded', [...expanded]);
+  savePref(vkey('sb.expanded'), [...expanded]);
 }
 
 // ---------- 링크 따라가기 ----------
@@ -864,14 +968,14 @@ function updateTabTitles() {
 }
 
 function saveWorkspace() {
-  savePref('sb.workspace', {
+  savePref(vkey('sb.workspace'), {
     tabs: tabs.map((t) => ({ kind: t.kind, noteId: t.noteId, mode: t.mode })),
     active: tabs.indexOf(activeTab),
   });
 }
 
 function restoreWorkspace() {
-  const ws = loadPref('sb.workspace', null);
+  const ws = loadPref(vkey('sb.workspace'), null);
   const hashId = /^#\/n\/(.+)$/.exec(location.hash)?.[1] || location.hash.slice(1);
   for (const t of ws?.tabs || []) {
     if (t.kind === 'note' && !store.notes.has(t.noteId)) continue;
@@ -998,6 +1102,7 @@ function mountNote(tab) {
   tab.editor?.destroy();
   if (!edits.has(id)) edits.set(id, { text: n.content, dirty: false });
   tab.titleEl.textContent = n.title;
+  tab.titleEl.contentEditable = canWrite() ? 'true' : 'false';
   tab.editor = createEditor(tab.cmHost, textOf(id), {
     resolve: resolveNote,
     notes: () => {
@@ -1014,6 +1119,7 @@ function mountNote(tab) {
     onTag: (tag) => searchFor(`tag:#${tag}`),
     onHover: (anchor, target, sub) => hoverPreview(anchor, target, sub),
   });
+  if (!canWrite()) tab.editor.setEditable(false);
   renderCrumb(tab);
   renderConflict(tab);
   setMode(tab, tab.mode, { force: true });
@@ -1040,7 +1146,7 @@ function setMode(tab, mode, { force = false } = {}) {
   const reading = mode === 'preview';
   tab.cmHost.hidden = reading;
   tab.reading.hidden = !reading;
-  tab.titleEl.contentEditable = reading ? 'false' : 'true';
+  tab.titleEl.contentEditable = reading || !canWrite() ? 'false' : 'true';
   tab.modeBtn.innerHTML = icon(reading ? 'pencil' : 'book-open');
   const label = reading ? '편집 보기로 전환 (Ctrl+E)' : '읽기 보기로 전환 (Ctrl+E)';
   tab.modeBtn.setAttribute('aria-label', label);
@@ -1160,7 +1266,7 @@ function buildGraphLeaf(tab) {
     el('div', { class: 'graph-view' }, canvas, controls));
   tab.graph = createGraph(canvas, {
     onOpen: (node, newTab) => onGraphOpen(node, newTab || true),
-    colorOf: (n) => (settings.graph.authorColors && !n.tag && !n.unresolved ? (n.mine ? 'me' : 'other') : null),
+    colorOf: (n) => (settings.graph.authorColors && !n.tag && !n.unresolved ? store.members.get(n.editor)?.color || null : null),
   });
   refreshGraph(tab, { keep: false });
 }
@@ -1177,7 +1283,7 @@ function graphData({ tags = false, orphans = true, unresolved = true, filter = '
   const seen = new Set();
   const cur = activeNoteId();
   for (const n of store.notes.values()) {
-    nodes.set(n.id, { id: n.id, label: n.title, mine: n.updated_by === me(), current: n.id === cur });
+    nodes.set(n.id, { id: n.id, label: n.title, editor: n.updated_by, current: n.id === cur });
   }
   const addLink = (a, b) => {
     if (a === b) return;
@@ -1233,11 +1339,9 @@ function graphData({ tags = false, orphans = true, unresolved = true, filter = '
 function refreshGraph(tab, { keep = true } = {}) {
   if (!tab.graph) return;
   tab.graph.setData(graphData(settings.graph), { keepPositions: keep });
-  const other = [...store.members.entries()].find(([id]) => id !== me());
-  tab.graphLegend.replaceChildren(...(settings.graph.authorColors ? [
-    el('span', {}, el('i', { class: 'legend-dot me' }), `${nameOf(me())}`),
-    el('span', {}, el('i', { class: 'legend-dot other' }), `${other?.[1] || '상대방'}`),
-  ] : []));
+  tab.graphLegend.replaceChildren(...(settings.graph.authorColors
+    ? [...store.members.values()].map((m) => el('span', {}, el('i', { class: 'legend-dot', style: `background:${m.color}` }), m.name))
+    : []));
 }
 
 // ---------- 오른쪽 사이드바 ----------
@@ -1454,7 +1558,7 @@ async function renderHistory() {
   const pane = $('pane-history');
   const id = activeNoteId();
   if (!id) return pane.replaceChildren(paneEmpty('열린 노트가 없습니다'));
-  const { data } = await sb.from('sb_revisions').select('id,version,title,content,edited_by,edited_at').eq('note_id', id).order('edited_at', { ascending: false }).limit(50);
+  const { data } = await sb.from('brain_revisions').select('id,version,title,content,edited_by,edited_at').eq('note_id', id).order('edited_at', { ascending: false }).limit(50);
   if (activeNoteId() !== id) return;
   const n = store.notes.get(id);
   const list = el('div', { class: 'history-list' },
@@ -1560,7 +1664,7 @@ function renderFileTree() {
         class: 'tree-item-self nav-folder-title is-clickable',
         draggable: 'true',
         dataset: { path: f },
-        onclick: () => { if (open) expanded.delete(f); else expanded.add(f); savePref('sb.expanded', [...expanded]); renderFileTree(); },
+        onclick: () => { if (open) expanded.delete(f); else expanded.add(f); savePref(vkey('sb.expanded'), [...expanded]); renderFileTree(); },
         oncontextmenu: (e) => showMenu(e, [
           { label: '새 노트', icon: 'file-plus', action: () => createNote({ folder: f }) },
           { label: '새 폴더', icon: 'folder-plus', action: () => createFolder(f) },
@@ -1835,6 +1939,8 @@ const COMMANDS = [
   { id: 'tags', name: '태그 목록 보기', run: () => showPane('left', 'tags') },
   { id: 'theme', name: '어두운 / 밝은 테마 전환', run: () => toggleTheme() },
   { id: 'settings', name: '설정 열기', hotkey: 'Ctrl+,', run: () => openSettings() },
+  { id: 'members', name: '멤버와 초대 관리', run: () => openMembers() },
+  { id: 'switch-vault', name: '다른 보관함 열기 / 새 보관함 만들기', run: () => switchVault() },
   { id: 'logout', name: '로그아웃', run: () => logout() },
 ];
 
@@ -1924,8 +2030,130 @@ function openSettings() {
         ['노트 안에서 찾기', 'Ctrl+F'],
       ].map(([a, b]) => el('div', { class: 'hotkey-row' }, el('span', { text: a }), el('kbd', { text: b })))),
       el('h3', { text: '계정' }),
-      row(nameOf(me()), store.user.email, el('button', { text: '로그아웃', onclick: () => logout() }))),
+      row('내 이름', '다른 멤버에게 보이는 이름입니다', el('button', { text: `${nameOf(me())} · 바꾸기`, onclick: () => renameProfile() })),
+      row('보관함', `지금: ${store.vault.name} (${roleLabel(store.vault.role)})`, el('div', { class: 'setting-buttons' },
+        el('button', { text: '멤버와 초대', onclick: () => openMembers() }),
+        el('button', { text: '다른 보관함', onclick: () => switchVault() }))),
+      row(store.user.email, null, el('button', { text: '로그아웃', onclick: () => logout() }))),
   });
+}
+
+// ---------- 보관함 전환 / 멤버와 초대 ----------
+function renderVaultSwitcher() {
+  const box = $('vault-switcher');
+  box.replaceChildren(el('div', {
+    class: 'vault-switcher-button',
+    title: '보관함 바꾸기 / 멤버 관리',
+    onclick: (e) => showMenu(e, [
+      ...store.vaults.map((v) => ({ label: (v.id === store.vault.id ? '✓ ' : '') + v.name, icon: 'files', action: () => v.id !== store.vault.id && openVault(v) })),
+      '-',
+      { label: '멤버와 초대…', icon: 'users', action: () => openMembers() },
+      { label: '새 보관함 만들기 / 초대 확인…', icon: 'plus', action: () => switchVault() },
+    ]),
+  },
+  el('span', { class: 'vault-switcher-name', text: store.vault.name }),
+  el('span', { class: 'vault-switcher-count', text: `${store.members.size || 1}명` }),
+  el('span', { html: icon('chevron-down', 14) })));
+}
+
+async function switchVault() {
+  await flushAll();
+  await loadVaults();
+  showVaultPicker();
+}
+
+async function renameProfile() {
+  const name = await promptText({ title: '내 이름', value: nameOf(me()), placeholder: '다른 멤버에게 보이는 이름' });
+  if (!name) return;
+  const { error } = await sb.from('brain_profiles').update({ display_name: name.slice(0, 40), updated_at: new Date().toISOString() }).eq('user_id', me());
+  if (error) return notice('이름을 바꾸지 못했습니다');
+  store.profileName = name;
+  await loadMembers();
+  scheduleRefresh();
+  notice('이름을 바꿨습니다', 1500);
+}
+
+async function openMembers() {
+  await loadMembers();
+  const owner = isOwner();
+  const body = el('div', { class: 'members-modal' });
+  const m = openModal({ title: `"${store.vault.name}" 멤버와 초대`, cls: 'mod-wide', content: body });
+  const refresh = async () => { await loadMembers(); renderVaultSwitcher(); draw(); };
+
+  async function draw() {
+    const invites = owner
+      ? (await sb.from('brain_invites').select('id,email,role,created_at').eq('vault_id', store.vault.id).is('claimed_at', null).is('revoked_at', null).order('created_at')).data || []
+      : [];
+    const memberRows = [...store.members.entries()].map(([uid, mem]) => el('div', { class: 'member-row' },
+      el('span', { class: 'member-dot', style: `background:${mem.color}`, text: mem.name.slice(0, 1) }),
+      el('div', { class: 'member-info' },
+        el('div', { class: 'member-name', text: mem.name + (uid === me() ? ' (나)' : '') }),
+        el('div', { class: 'muted small', text: mem.email })),
+      owner && uid !== me()
+        ? el('select', { class: 'dropdown', onchange: async (e) => {
+          const { error } = await sb.rpc('brain_set_member', { p_vault: store.vault.id, p_user: uid, p_role: e.target.value });
+          if (error) notice(error.message.includes('last owner') ? '소유자가 한 명은 있어야 합니다' : '권한을 바꾸지 못했습니다');
+          refresh();
+        } }, ['owner', 'editor', 'viewer'].map((r) => el('option', { value: r, selected: r === mem.role || null, text: roleLabel(r) })))
+        : el('span', { class: 'member-role', text: roleLabel(mem.role) }),
+      (owner && uid !== me()) ? el('button', { class: 'small-button', text: '내보내기', onclick: async () => {
+        if (!(await confirmModal({ title: '멤버 내보내기', text: `${mem.name}님을 이 보관함에서 내보낼까요? 쓴 노트는 그대로 남습니다.`, okText: '내보내기', danger: true }))) return;
+        const { error } = await sb.rpc('brain_set_member', { p_vault: store.vault.id, p_user: uid, p_role: null });
+        if (error) notice('내보내지 못했습니다');
+        refresh();
+      } }) : null));
+
+    const email = el('input', { type: 'text', placeholder: '초대할 사람의 Google 이메일', autocomplete: 'off' });
+    const role = el('select', { class: 'dropdown' }, el('option', { value: 'editor', text: '편집자' }), el('option', { value: 'viewer', text: '읽기 전용' }));
+    const invite = async () => {
+      const v = email.value.trim();
+      if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)) { notice('이메일 주소를 확인해 주세요'); return email.focus(); }
+      const { error } = await sb.rpc('brain_invite', { p_vault: store.vault.id, p_email: v, p_role: role.value });
+      if (error) return notice(error.message.includes('already') ? '이미 이 보관함의 멤버입니다' : '초대하지 못했습니다');
+      notice(`${v} 님을 초대했습니다. 그 계정으로 로그인하면 초대가 보입니다.`, 4000);
+      draw();
+    };
+    email.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) invite(); });
+
+    body.replaceChildren(...[
+      el('div', { class: 'members-section-title', text: `멤버 ${store.members.size}명` }),
+      ...memberRows,
+      owner ? el('div', { class: 'members-section-title', text: '이메일로 초대' }) : null,
+      owner ? el('div', { class: 'invite-form' }, email, role, el('button', { class: 'mod-cta', text: '초대', onclick: invite })) : null,
+      owner ? el('div', { class: 'muted small', text: '초대받은 사람이 같은 이메일의 Google 계정으로 로그인하면 보관함 목록에 초대가 나타납니다. 이 사이트 주소를 함께 알려 주세요.' }) : null,
+      owner && invites.length ? el('div', { class: 'members-section-title', text: '수락 대기 중인 초대' }) : null,
+      ...invites.map((inv) => el('div', { class: 'member-row' },
+        el('span', { class: 'member-dot is-pending', html: icon('users', 12) }),
+        el('div', { class: 'member-info' }, el('div', { class: 'member-name', text: inv.email }), el('div', { class: 'muted small', text: `${roleLabel(inv.role)} · ${relTime(inv.created_at)} 초대` })),
+        el('button', { class: 'small-button', text: '초대 취소', onclick: async () => {
+          const { error } = await sb.rpc('brain_revoke_invite', { p_invite: inv.id });
+          if (error) notice('취소하지 못했습니다');
+          draw();
+        } }))),
+      !owner ? el('p', { class: 'muted small', text: '초대와 권한 변경은 보관함 소유자만 할 수 있습니다.' }) : null,
+      el('div', { class: 'members-section-title', text: '보관함' }),
+      el('div', { class: 'member-actions' },
+        owner ? el('button', { text: '보관함 이름 바꾸기', onclick: async () => {
+          const name = await promptText({ title: '보관함 이름', value: store.vault.name });
+          if (!name) return;
+          const { error } = await sb.rpc('brain_rename_vault', { p_vault: store.vault.id, p_name: name });
+          if (error) return notice('이름을 바꾸지 못했습니다');
+          store.vault.name = name;
+          const v = store.vaults.find((x) => x.id === store.vault.id);
+          if (v) v.name = name;
+          document.title = `${name} - Second Brain`;
+          renderVaultSwitcher();
+          m.close();
+        } }) : null,
+        el('button', { class: 'mod-warning-outline', text: '이 보관함에서 나가기', onclick: async () => {
+          if (!(await confirmModal({ title: '보관함에서 나가기', text: `"${store.vault.name}"에서 나갈까요? 다시 들어오려면 소유자에게 초대를 받아야 합니다.`, okText: '나가기', danger: true }))) return;
+          const { error } = await sb.rpc('brain_set_member', { p_vault: store.vault.id, p_user: me(), p_role: null });
+          if (error) return notice(error.message.includes('last owner') ? '마지막 소유자는 나갈 수 없습니다. 다른 멤버를 먼저 소유자로 지정해 주세요.' : '나가지 못했습니다');
+          localStorage.removeItem('sb.vault');
+          location.reload();
+        } }))].filter(Boolean));
+  }
+  draw();
 }
 
 // ---------- 사이드바 / 모바일 서랍 ----------
@@ -1991,8 +2219,8 @@ function renderStatus() {
   const p = $('status-presence');
   const online = others.filter((o) => o.user_id !== me());
   if (!online.length) {
-    const other = [...store.members.entries()].find(([uid]) => uid !== me());
-    p.replaceChildren(el('span', { class: 'presence-offline', text: other ? `${other[1]}님 오프라인` : '' }));
+    const count = store.members.size - 1;
+    p.replaceChildren(el('span', { class: 'presence-offline', text: count > 0 ? `다른 멤버 ${count}명 · 접속 없음` : '혼자 쓰는 보관함 · 설정에서 초대할 수 있습니다' }));
   } else {
     p.replaceChildren(...online.map((o) => {
       const n = o.note && store.notes.get(o.note);
@@ -2000,7 +2228,7 @@ function renderStatus() {
         class: 'presence-online',
         title: n ? '눌러서 같은 노트 열기' : '',
         onclick: () => n && openNote(n.id),
-      }, el('i', { class: 'presence-online-dot' }), `${o.name}${n ? ` · ${n.title}` : ' 접속 중'}`);
+      }, el('i', { class: 'presence-online-dot', style: `background:${store.members.get(o.user_id)?.color || ''}` }), `${o.name}${n ? ` · ${n.title}` : ' 접속 중'}`);
     }));
   }
 }
@@ -2028,12 +2256,17 @@ function refreshAll() {
 
 // ---------- 실시간 / 접속 표시 ----------
 function subscribeRealtime() {
-  sb.channel('sb_changes')
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'sb_notes' }, (payload) => {
+  const filter = `vault_id=eq.${store.vault.id}`;
+  sb.channel(`brain_changes:${store.vault.id}`)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'brain_notes', filter }, (payload) => {
       if (payload.new?.id) applyRow(payload.new);
     })
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'sb_folders' }, async () => {
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'brain_folders', filter }, async () => {
       await reloadFolders();
+      scheduleRefresh();
+    })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'brain_members', filter }, async () => {
+      await loadMembers();
       scheduleRefresh();
     })
     .subscribe();
@@ -2041,7 +2274,7 @@ function subscribeRealtime() {
 
 let presenceChannel = null;
 function setupPresence() {
-  presenceChannel = sb.channel('sb_presence', { config: { presence: { key: me() } } });
+  presenceChannel = sb.channel(`brain_presence:${store.vault.id}`, { config: { presence: { key: me() } } });
   presenceChannel
     .on('presence', { event: 'sync' }, () => {
       const st = presenceChannel.presenceState();
@@ -2084,7 +2317,7 @@ function setupStaticUI() {
         ['name-asc', '이름 (가나다순)'], ['name-desc', '이름 (역순)'], ['mtime-desc', '수정 시간 (최신 먼저)'],
         ['mtime-asc', '수정 시간 (오래된 것 먼저)'], ['ctime-desc', '만든 시간 (최신 먼저)'],
       ].map(([v, label]) => ({ label: (settings.sort === v ? '✓ ' : '') + label, icon: 'sort', action: () => { settings.sort = v; saveSettings(); renderFileTree(); } })));
-      if (cmd === 'collapse-all') { expanded.clear(); savePref('sb.expanded', []); return renderFileTree(); }
+      if (cmd === 'collapse-all') { expanded.clear(); savePref(vkey('sb.expanded'), []); return renderFileTree(); }
       if (cmd === 'new-folder') return createFolder('');
       return runCommand(cmd);
     }

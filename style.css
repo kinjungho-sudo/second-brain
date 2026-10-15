@@ -851,3 +851,67 @@ body.readable-line-width .view-sizer { max-width: var(--line-width); }
   .modal-container { padding-top: 8vh; }
   .popover { display: none; }
 }
+
+/* ===== 보관함 / 멤버 ===== */
+.card-desc { font-size: 13.5px; color: var(--text-muted); line-height: 1.6; margin: 12px 0 0; }
+.vault-picker { max-width: 520px; text-align: left; padding: 28px; }
+.vault-picker-header { text-align: center; margin-bottom: 8px; }
+.vault-picker-logo { color: var(--interactive-accent); display: flex; justify-content: center; }
+.vault-picker-header h1 { margin: 6px 0 4px; font-size: 22px; }
+.vault-picker-section { margin-top: 20px; }
+.vault-picker-section-title { font-size: 12px; font-weight: 600; color: var(--text-muted); margin-bottom: 6px; }
+.vault-picker-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-m);
+  margin-bottom: 6px;
+}
+.vault-picker-item.is-clickable { cursor: pointer; }
+.vault-picker-item.is-clickable:hover { background: var(--background-modifier-hover); border-color: var(--interactive-accent); }
+.vault-picker-name { font-weight: 600; }
+.vault-picker-create { display: flex; gap: 8px; margin-bottom: 6px; }
+.vault-picker-create input { flex: 1; min-width: 0; }
+.vault-picker-create button, .vault-picker-item button { margin: 0; }
+.vault-picker-footer { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; justify-content: flex-end; margin-top: 24px; padding-top: 14px; border-top: 1px solid var(--background-modifier-border); }
+.vault-picker-footer span { margin-right: auto; }
+.vault-picker-footer button { margin: 0; padding: 5px 12px; font-size: 13px; }
+
+.vault-switcher { flex-shrink: 0; border-top: 1px solid var(--background-modifier-border); padding: 6px; }
+.vault-switcher-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  font-size: var(--font-ui-small);
+  color: var(--text-normal);
+}
+.vault-switcher-button:hover { background: var(--background-modifier-hover); }
+.vault-switcher-name { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vault-switcher-count { color: var(--text-faint); font-size: 12px; }
+
+.members-section-title { font-size: 12px; font-weight: 600; color: var(--text-muted); margin: 16px 0 6px; }
+.members-section-title:first-child { margin-top: 0; }
+.member-row { display: flex; align-items: center; gap: 10px; padding: 7px 4px; border-bottom: 1px solid var(--background-modifier-border); }
+.member-dot { width: 28px; height: 28px; border-radius: 50%; display: grid; place-items: center; color: #111; font-weight: 700; font-size: 13px; flex-shrink: 0; }
+.member-dot.is-pending { background: var(--background-modifier-hover); color: var(--text-muted); }
+.member-info { flex: 1; min-width: 0; }
+.member-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.member-role { font-size: 12.5px; color: var(--text-muted); }
+.invite-form { display: flex; gap: 8px; margin-bottom: 6px; }
+.invite-form input { flex: 1; min-width: 0; }
+.member-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+button.mod-warning-outline { color: var(--text-error); border-color: var(--text-error); background: transparent; }
+.setting-buttons { display: flex; gap: 6px; flex-wrap: wrap; }
+.notice-action { display: flex; align-items: center; gap: 8px; cursor: default; }
+.notice-action button { font-size: 12px; padding: 3px 10px; }
+body.is-readonly [data-cmd="new-note"], body.is-readonly [data-cmd="new-folder"], body.is-readonly [data-cmd="daily"] { opacity: 0.35; pointer-events: none; }
+@media (max-width: 800px) {
+  .invite-form { flex-wrap: wrap; }
+  .invite-form input { flex-basis: 100%; }
+}
