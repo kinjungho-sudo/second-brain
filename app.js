@@ -2285,17 +2285,28 @@ function setupPresence() {
       renderTabBar();
       renderFileTree();
     })
-    .subscribe((status) => { if (status === 'SUBSCRIBED') updatePresence(); });
+    .subscribe((status) => {
+      if (status !== 'SUBSCRIBED') return;
+      presenceReady = true;
+      presenceSent = undefined;
+      updatePresence();
+    });
   document.addEventListener('visibilitychange', updatePresence);
 }
 
 let presenceTimer = 0;
+// 보고 있는 노트가 실제로 바뀔 때만, 1.5초에 한 번까지만 알린다 (Supabase 접속 표시 횟수 제한)
+let presenceReady = false;
+let presenceSent;
 function updatePresence() {
   clearTimeout(presenceTimer);
   presenceTimer = setTimeout(() => {
-    if (!presenceChannel) return;
-    presenceChannel.track({ note: document.hidden ? null : activeNoteId(), at: Date.now() });
-  }, 300);
+    if (!presenceChannel || !presenceReady) return;
+    const note = document.hidden ? null : activeNoteId();
+    if (note === presenceSent) return;
+    presenceSent = note;
+    presenceChannel.track({ note });
+  }, 1500);
 }
 
 // ---------- 정적 UI 연결 ----------
