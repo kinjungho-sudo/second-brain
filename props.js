@@ -4,6 +4,10 @@
 // Obsidian(app.js)의 기본 속성: tags / aliases / cssclasses 는 이름의 대소문자를 구분하지 않고 목록으로 다룬다.
 const LIST_KEYS = new Set(['tags', 'aliases', 'cssclasses']);
 const isListKey = (k) => LIST_KEYS.has(String(k).toLowerCase());
+// 속성 이름 → 타입 (이 브라우저에 저장. Obsidian의 .obsidian/types.json 역할)
+const HINT_KEY = 'sb.propTypes';
+const typeHints = () => { try { return JSON.parse(localStorage.getItem(HINT_KEY) || '{}'); } catch { return {}; } };
+const rememberType = (key, type) => { try { localStorage.setItem(HINT_KEY, JSON.stringify({ ...typeHints(), [key]: type })); } catch { /* 저장 못 해도 값은 정상 */ } };
 // Obsidian의 날짜 형식: YYYY-MM-DD 와 YYYY-MM-DDTHH:mm
 const DATE_RE = /^\d{4}-[01]\d-[0-3]\d$/;
 const DATETIME_RE = /^\d{4}-[01]\d-[0-3]\dT[0-2]\d:[0-5]\d$/;
@@ -45,7 +49,14 @@ export function parseFrontmatter(text) {
       const items = rest.map((r) => /^\s*-\s*(.*)$/.exec(r));
       if (rest.length && items.every(Boolean)) entries.push({ key, type: 'list', value: items.map((x) => unquote(x[1].trim())).filter((x) => x !== '') });
       else if (rest.length) entries.push({ key, type: 'raw', lines: [line, ...rest] });
-      else entries.push(isListKey(key) ? { key, type: 'list', value: [] } : { key, type: 'text', value: '' });
+      else {
+        // 값이 비면 YAML만으로는 타입을 알 수 없다 → Obsidian(metadataTypeManager)처럼 속성 이름별로 기억한 타입을 쓴다
+        const hint = isListKey(key) ? 'list' : typeHints()[key];
+        entries.push(hint === 'list' ? { key, type: 'list', value: [] }
+          : hint === 'checkbox' ? { key, type: 'checkbox', value: false }
+            : hint === 'number' || hint === 'date' || hint === 'datetime' ? { key, type: hint, value: '' }
+              : { key, type: 'text', value: '' });
+      }
     } else if (rest.length || /^[|>]/.test(v) || /^[{&*!]/.test(v)) {
       entries.push({ key, type: 'raw', lines: [line, ...rest] });
     } else if (v.startsWith('[') && v.endsWith(']')) {
@@ -123,7 +134,8 @@ function h(tag, props = {}, ...kids) {
 export function renderProps(container, fm, opts = {}) {
   const { editable = false, mutate, onTag } = opts;
   const open = isOpen();
-  container.className = 'properties' + (open ? '' : ' is-collapsed');
+  container.classList.add('properties');
+  container.classList.toggle('is-collapsed', !open);
   container.replaceChildren();
   const structural = (fn) => { document.activeElement?.blur?.(); mutate(fn); };
 
@@ -181,6 +193,7 @@ export function renderProps(container, fm, opts = {}) {
       if (!key) { keyIn.focus(); return; }
       const type = isListKey(key) ? 'list' : typeSel.value;
       const value = type === 'list' ? [] : type === 'checkbox' ? false : '';
+      rememberType(key, type);
       structural((es) => { if (!es.some((x) => x.key === key)) es.push({ key, type, value }); });
     };
     keyIn.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' && !ev.isComposing) { ev.preventDefault(); add(); } });
