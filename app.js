@@ -8,7 +8,8 @@ import { icon } from './icons.js';
 import { DEFAULT_RULES } from './wiki-rules.js';
 import { readVaultFiles, dedupe, buildZip } from './io.js';
 import { isAttachmentName, kindOf, extOf, cleanName, pastedName, availableName, mimeOf, fmtBytes, MAX_FILE_SIZE } from './files.js';
-import { parseFrontmatter, renderProps } from './props.js';
+import { parseFrontmatter, serializeFrontmatter, renderProps } from './props.js';
+import { applyVars, mergeEntries, formatDate, DEFAULT_DATE_FORMAT, DEFAULT_TIME_FORMAT } from './templates.js';
 import { SUPABASE_URL } from './config.js';
 
 // 공개 키(publishable)만 사용한다. 실제 접근 통제는 DB의 RLS가 담당한다.
@@ -21,6 +22,57 @@ const $ = (id) => document.getElementById(id);
 const keyOf = (title) => String(title || '').trim().toLowerCase();
 const isMobile = () => window.matchMedia('(max-width: 800px)').matches;
 
+// ---------- 템플릿 ----------
+function templateNotes() {
+  const tf = settings.templateFolder;
+  if (!tf) return null;
+  return [...store.notes.values()]
+    .filter((n) => n.folder === tf || n.folder.startsWith(`${tf}/`))
+    .map((n) => ({ note: n, path: `${n.folder === tf ? '' : `${n.folder.slice(tf.length + 1)}/`}${n.title}` }))
+    .sort((a, b) => a.path.localeCompare(b.path, 'ko'));
+}
+
+function openTemplatePicker() {
+  if (activeTab?.kind !== 'note' || !activeTab.editor || !canWrite()) return notice('템플릿을 넣을 노트를 먼저 열어 주세요');
+  const list = templateNotes();
+  if (list === null) return notice('템플릿 폴더가 정해지지 않았습니다. 설정 → 템플릿 폴더에서 정해 주세요', 5000);
+  if (!list.length) return notice(`"${settings.templateFolder}" 폴더에 템플릿 노트가 없습니다`, 5000);
+  openSuggest({
+    placeholder: '넣을 템플릿을 고르세요…',
+    items: (q) => list.filter((t) => !q || fuzzy(q, t.path)).map((t) => ({ title: t.path, run: () => insertTemplate(t.note) })),
+  });
+}
+
+// Obsidian과 같이: 커서가 맨 앞이면 전체를, 아니면 본문만 넣고 템플릿 속성은 노트 속성에 합친다
+function insertTemplate(tplNote) {
+  const tab = activeTab;
+  if (tab?.kind !== 'note' || !tab.editor || !canWrite()) return;
+  if (tab.mode === 'preview') setMode(tab, 'source');
+  const title = store.notes.get(tab.noteId)?.title || '';
+  const text = applyVars(textOf(tplNote.id), { title }, settings);
+  const view = tab.editor.view;
+  const sel = view.state.selection.main;
+  const doc = view.state.doc.toString();
+  const fmTpl = sel.from === 0 ? null : parseFrontmatter(text);
+  if (!fmTpl) {
+    view.dispatch({ changes: { from: sel.from, to: sel.to, insert: text }, selection: { anchor: sel.from + text.length } });
+  } else {
+    const body = text.slice(fmTpl.to).replace(/^\n/, '');
+    const fmNote = parseFrontmatter(doc);
+    const block = serializeFrontmatter(mergeEntries(fmNote ? fmNote.entries : [], fmTpl.entries));
+    const changes = [{ from: sel.from, to: sel.to, insert: body }];
+    changes.push(fmNote ? { from: 0, to: fmNote.to, insert: block } : { from: 0, insert: `${block}\n` });
+    view.dispatch({ changes });
+  }
+  view.focus();
+}
+
+function insertNow(kind) {
+  const editor = activeTab?.kind === 'note' ? activeTab.editor : null;
+  if (!editor || !canWrite()) return;
+  editor.insertAtCursor(formatDate(new Date(), kind === 'date' ? settings.dateFormat || DEFAULT_DATE_FORMAT : settings.timeFormat || DEFAULT_TIME_FORMAT));
+}
+
 // ---------- 설정 ----------
 const DEFAULT_SETTINGS = {
   theme: 'dark',              // dark | light | system
@@ -30,6 +82,9 @@ const DEFAULT_SETTINGS = {
   newNoteLocation: 'root',    // root | current
   alwaysUpdateLinks: 'ask',   // ask | always | never
   dailyFolder: 'Daily',
+  templateFolder: '',         // 템플릿 노트가 든 폴더 (Obsidian 템플릿 플러그인과 같음)
+  dateFormat: DEFAULT_DATE_FORMAT,
+  timeFormat: DEFAULT_TIME_FORMAT,
   sort: 'name-asc',
   graph: { tags: false, orphans: true, unresolved: true, authorColors: false, filter: '' },
   localDepth: 1,
@@ -1952,6 +2007,9 @@ const COMMANDS = [
   { id: 'graph', name: '그래프 뷰 열기', hotkey: 'Ctrl+G', run: () => openGraph() },
   { id: 'daily', name: '오늘의 데일리 노트 열기', hotkey: 'Alt+D', run: () => openDaily() },
   { id: 'toggle-mode', name: '읽기 / 편집 보기 전환', hotkey: 'Ctrl+E', run: () => toggleMode() },
+  { id: 'insert-template', name: '템플릿 삽입', run: () => openTemplatePicker() },
+  { id: 'insert-date', name: '현재 날짜 삽입', run: () => insertNow('date') },
+  { id: 'insert-time', name: '현재 시간 삽입', run: () => insertNow('time') },
   { id: 'attach', name: '첨부 파일 추가 (이미지·PDF·오디오·비디오)', run: () => attachFiles() },
   { id: 'files', name: '첨부 파일 관리', run: () => openFiles() },
   { id: 'add-props', name: '현재 노트에 속성 추가', run: () => addProperties() },
@@ -2221,6 +2279,9 @@ function openSettings() {
       row('새 노트 위치', null, select('newNoteLocation', [['root', '최상위'], ['current', '지금 노트와 같은 폴더']])),
       row('이름을 바꿀 때 링크 업데이트', 'Obsidian의 "내부 링크 자동 업데이트"', select('alwaysUpdateLinks', [['ask', '매번 묻기'], ['always', '항상 업데이트'], ['never', '업데이트 안 함']])),
       row('데일리 노트 폴더', null, daily),
+      row('템플릿 폴더', '이 폴더 안의 노트가 템플릿 목록이 됩니다. 예: Templates', el('input', { type: 'text', value: settings.templateFolder, placeholder: 'Templates', onchange: (e) => { settings.templateFolder = e.target.value.trim().replace(/^\/+|\/+$/g, ''); saveSettings(); } })),
+      row('템플릿 날짜 형식', '{{date}}에 쓰입니다. 예: YYYY-MM-DD', el('input', { type: 'text', value: settings.dateFormat, onchange: (e) => { settings.dateFormat = e.target.value.trim() || DEFAULT_DATE_FORMAT; saveSettings(); } })),
+      row('템플릿 시간 형식', '{{time}}에 쓰입니다. 예: HH:mm', el('input', { type: 'text', value: settings.timeFormat, onchange: (e) => { settings.timeFormat = e.target.value.trim() || DEFAULT_TIME_FORMAT; saveSettings(); } })),
       el('h3', { text: '단축키' }),
       el('div', { class: 'hotkey-list' }, COMMANDS.filter((c) => c.hotkey).map((c) => el('div', { class: 'hotkey-row' }, el('span', { text: c.name }), el('kbd', { text: c.hotkey })))),
       el('div', { class: 'hotkey-list' }, [
