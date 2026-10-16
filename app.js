@@ -7,6 +7,7 @@ import { createGraph } from './graph.js';
 import { icon } from './icons.js';
 import { DEFAULT_RULES } from './wiki-rules.js';
 import { readVaultFiles, dedupe, buildZip } from './io.js';
+import { isAttachmentName, kindOf, extOf, cleanName, pastedName, availableName, mimeOf, fmtBytes, MAX_FILE_SIZE } from './files.js';
 import { parseFrontmatter, renderProps } from './props.js';
 import { SUPABASE_URL } from './config.js';
 
@@ -58,6 +59,8 @@ const store = {
   notes: new Map(),        // id -> row
   byKey: new Map(),        // 소문자 제목 -> row
   folders: new Set(),      // brain_folders
+  files: new Map(),        // 첨부 파일 id -> row (brain_files)
+  fileByKey: new Map(),    // 소문자 파일 이름 -> row
   recent: [],
 };
 // 보관함마다 따로 저장하는 화면 상태
@@ -94,7 +97,7 @@ function metaOf(id) {
   const c = metaCache.get(id);
   if (c && c.text === text) return c;
   const plain = stripCode(text);
-  const links = [...plain.matchAll(WIKILINK_RE)].map((m) => ({ embed: !!m[1], target: m[2].trim(), sub: (m[3] || '').slice(1).trim() }));
+  const links = [...plain.matchAll(WIKILINK_RE)].map((m) => ({ embed: !!m[1], target: m[2].trim(), sub: (m[3] || '').slice(1).trim() })).filter((l) => !isAttachmentName(l.target)); // 첨부 파일은 노트 링크가 아님
   const meta = { text, links, keys: new Set(links.map((l) => keyOf(l.target))), tags: tagsOf(text), headings: headingsOf(text) };
   metaCache.set(id, meta);
   return meta;
@@ -315,7 +318,7 @@ function showPopover(anchor, target, sub) {
   const pop = el('div', { class: 'popover hover-popover' },
     el('div', { class: 'popover-title' }, el('span', { text: note.title }), note.folder ? el('span', { class: 'muted', text: ` · ${note.folder}` }) : null),
     body);
-  renderInto(body, note.content || '*(빈 노트)*', { resolve: resolveNote, depth: 1 });
+  renderInto(body, note.content || '*(빈 노트)*', { resolve: resolveNote, attachment: attachmentOf, fileUrl, depth: 1 });
   pop.addEventListener('mouseenter', () => clearTimeout(hover.hideTimer));
   pop.addEventListener('mouseleave', scheduleHideHover);
   pop.addEventListener('click', (e) => onRenderedClick(e, null));
@@ -482,6 +485,7 @@ async function loadAll() {
   for (const row of notesRes.data) { seen.add(row.id); applyRow(row, { quiet: true }); }
   for (const id of [...store.notes.keys()]) if (!seen.has(id)) removeNote(id);
   store.folders = new Set((foldersRes.data || []).map((f) => f.path));
+  await loadFiles();
   rebuildIndex();
   scheduleRefresh(true);
 }
@@ -1121,6 +1125,9 @@ function mountNote(tab) {
       onEditorChange(id, text);
       if (tab.mode === 'preview') renderReading(tab);
     },
+    attachment: attachmentOf,
+    fileUrl,
+    onFiles: handleFiles,
     onOpenLink: (target, sub, newTab) => followLink(target, sub, newTab),
     onTag: (tag) => searchFor(`tag:#${tag}`),
     onHover: (anchor, target, sub) => hoverPreview(anchor, target, sub),
@@ -1171,6 +1178,8 @@ function renderReading(tab) {
   const id = tab.noteId;
   renderInto(tab.reading, textOf(id), {
     resolve: resolveNote,
+    attachment: attachmentOf,
+    fileUrl,
     onToggleTask: (i, checked) => updateNoteContent(id, toggleTask(textOf(id), i, checked)),
   });
   const fm = parseFrontmatter(textOf(id));
@@ -1943,6 +1952,8 @@ const COMMANDS = [
   { id: 'graph', name: '그래프 뷰 열기', hotkey: 'Ctrl+G', run: () => openGraph() },
   { id: 'daily', name: '오늘의 데일리 노트 열기', hotkey: 'Alt+D', run: () => openDaily() },
   { id: 'toggle-mode', name: '읽기 / 편집 보기 전환', hotkey: 'Ctrl+E', run: () => toggleMode() },
+  { id: 'attach', name: '첨부 파일 추가 (이미지·PDF·오디오·비디오)', run: () => attachFiles() },
+  { id: 'files', name: '첨부 파일 관리', run: () => openFiles() },
   { id: 'add-props', name: '현재 노트에 속성 추가', run: () => addProperties() },
   { id: 'rename', name: '현재 노트 이름 바꾸기', hotkey: 'F2', run: () => focusTitle() },
   { id: 'move', name: '현재 노트를 다른 폴더로 이동', run: () => activeNoteId() && pickFolderAndMove(activeNoteId()) },
@@ -1972,6 +1983,108 @@ const COMMANDS = [
   { id: 'logout', name: '로그아웃', run: () => logout() },
 ];
 
+// ---------- 첨부 파일 (이미지·PDF·오디오·비디오) ----------
+const urlCache = new Map();
+
+function rebuildFiles() {
+  store.fileByKey = new Map([...store.files.values()].map((f) => [keyOf(f.name), f]));
+}
+
+// ![[폴더/그림.png]] 처럼 경로가 붙어도 파일 이름으로 찾는다 (Obsidian과 같음)
+function attachmentOf(name) {
+  return store.fileByKey.get(keyOf(String(name || '').split('/').pop())) || null;
+}
+
+function fileUrl(file) {
+  const c = urlCache.get(file.id);
+  if (c && c.exp > Date.now()) return c.p;
+  const p = sb.storage.from('brain-files').createSignedUrl(`${file.vault_id}/${file.id}`, 3600)
+    .then(({ data, error }) => { if (error) throw error; return data.signedUrl; });
+  urlCache.set(file.id, { p, exp: Date.now() + 50 * 60 * 1000 });
+  p.catch(() => urlCache.delete(file.id));
+  return p;
+}
+
+function applyFile(row) {
+  store.files.set(row.id, row);
+  rebuildFiles();
+}
+
+async function loadFiles() {
+  const res = await sb.from('brain_files').select('*').eq('vault_id', store.vault.id);
+  if (res.error) { store.files = new Map(); rebuildFiles(); return; } // 첨부 기능 준비 전(테이블 없음)에도 앱은 그대로 동작
+  store.files = new Map(res.data.map((f) => [f.id, f]));
+  rebuildFiles();
+}
+
+async function uploadFile(blob, wantedName, { folder = '' } = {}) {
+  if (!canWrite()) { notice('읽기 전용 보관함입니다'); return null; }
+  if (blob.size > MAX_FILE_SIZE) { notice(`"${wantedName}" ${fmtBytes(blob.size)}: 50MB를 넘는 파일은 올릴 수 없습니다`, 5000); return null; }
+  let name = cleanName(wantedName);
+  if (!kindOf(name)) { notice(`"${name}"은(는) 지원하지 않는 형식입니다 (이미지·오디오·비디오·PDF)`, 5000); return null; }
+  name = availableName(name, (n) => store.fileByKey.has(keyOf(n)));
+  const id = crypto.randomUUID();
+  const path = `${store.vault.id}/${id}`;
+  const mime = mimeOf(name, blob.type);
+  const up = await sb.storage.from('brain-files').upload(path, blob, { contentType: mime, upsert: false });
+  if (up.error) { notice('파일을 올리지 못했습니다', 5000); return null; }
+  const { data, error } = await sb.from('brain_files').insert({ id, vault_id: store.vault.id, name, folder, mime, size: blob.size }).select('*').single();
+  if (error) { await sb.storage.from('brain-files').remove([path]); notice('파일 정보를 저장하지 못했습니다', 5000); return null; }
+  applyFile(data);
+  return data;
+}
+
+// 붙여넣기·끌어놓기·"첨부 파일 추가"로 들어온 파일을 올리고 노트에 넣을 이름 목록을 돌려준다
+async function handleFiles(files, source = 'pick') {
+  const names = [];
+  for (const f of files) {
+    const ext = extOf(f.name) || (f.type.split('/')[1] || '').replace('jpeg', 'jpg');
+    // Obsidian: 붙여넣은 이미지는 "Pasted image YYYYMMDDHHmmss"
+    const wanted = source === 'paste' && /^image\.\w+$/i.test(f.name) ? pastedName(ext) : f.name;
+    notice(`올리는 중… ${f.name}`, 1500);
+    const row = await uploadFile(f, wanted);
+    if (row) names.push(row.name);
+  }
+  if (names.length) { notice(`${names.length}개를 첨부했습니다`, 2000); scheduleRefresh(true); }
+  return names;
+}
+
+async function attachFiles() {
+  if (activeTab?.kind !== 'note' || !activeTab.editor) return notice('노트를 먼저 열어 주세요');
+  const files = await pickFiles({});
+  if (!files.length) return;
+  const names = await handleFiles(files);
+  if (names.length) activeTab.editor.insertAtCursor(names.map((n) => `![[${n}]]`).join('\n'));
+}
+
+async function deleteFile(file) {
+  const ok = await confirmModal({ title: '첨부 파일 삭제', text: `"${file.name}"을(를) 삭제할까요? 이 파일을 쓰는 노트에서는 "파일이 없습니다"로 보입니다.`, okText: '삭제', danger: true });
+  if (!ok) return false;
+  const { error } = await sb.from('brain_files').delete().eq('id', file.id);
+  if (error) { notice('삭제하지 못했습니다'); return false; }
+  await sb.storage.from('brain-files').remove([`${file.vault_id}/${file.id}`]);
+  store.files.delete(file.id);
+  rebuildFiles();
+  scheduleRefresh(true);
+  return true;
+}
+
+function openFiles() {
+  const body = el('div', { class: 'files-manager' });
+  const draw = () => {
+    const rows = [...store.files.values()].sort((a, b) => a.name.localeCompare(b.name));
+    body.replaceChildren(rows.length
+      ? el('div', {}, rows.map((f) => el('div', { class: 'files-row' },
+        el('span', { class: 'files-name', text: f.name }),
+        el('span', { class: 'muted', text: `${fmtBytes(f.size)} · ${nameOf(f.created_by)}` }),
+        el('button', { text: '링크 복사', onclick: () => copyText(`![[${f.name}]]`) }),
+        canWrite() ? el('button', { class: 'mod-warning', text: '삭제', onclick: async () => { if (await deleteFile(f)) draw(); } }) : null)))
+      : el('p', { class: 'muted', text: '첨부한 파일이 없습니다. 노트에 이미지를 붙여넣거나 끌어놓으면 여기에 쌓입니다.' }));
+  };
+  draw();
+  openModal({ title: `첨부 파일 (${store.files.size})`, cls: 'mod-files', content: body, buttons: [{ text: '파일 추가', onClick: async () => { const fs = await pickFiles({}); if (fs.length) { await handleFiles(fs); draw(); } } }, { text: '닫기', onClick: (close) => close() }] });
+}
+
 // ---------- 가져오기 · 내보내기 ----------
 function pickFiles({ folder = false } = {}) {
   return new Promise((resolve) => {
@@ -1987,9 +2100,9 @@ async function importVault() {
   if (!canWrite()) return notice('읽기 전용 보관함입니다');
   const files = await pickFiles({ folder: true });
   if (!files.length) return;
-  const { notes, skipped } = await readVaultFiles(files);
-  if (!notes.length) return notice('가져올 .md 노트가 없습니다');
-  const ok = await confirmModal({ title: 'Obsidian 보관함 가져오기', text: `노트 ${notes.length}개를 "${store.vault.name}"에 추가합니다.${skipped ? ` (이미지 등 .md가 아닌 파일 ${skipped}개는 건너뜁니다)` : ''}`, okText: '가져오기' });
+  const { notes, attachments, skipped } = await readVaultFiles(files);
+  if (!notes.length && !attachments.length) return notice('가져올 노트나 첨부 파일이 없습니다');
+  const ok = await confirmModal({ title: 'Obsidian 보관함 가져오기', text: `노트 ${notes.length}개${attachments.length ? `와 첨부 파일 ${attachments.length}개` : ''}를 "${store.vault.name}"에 추가합니다.${skipped ? ` (지원하지 않는 형식 ${skipped}개는 건너뜁니다)` : ''}`, okText: '가져오기' });
   if (!ok) return;
   const renamed = dedupe(notes, new Set(store.byKey.keys()));
   let done = 0;
@@ -2001,22 +2114,34 @@ async function importVault() {
     done += data.length;
     notice(`가져오는 중… ${done}/${notes.length}`, 1500);
   }
+  let filesDone = 0;
+  for (const a of attachments) {
+    notice(`첨부 파일 올리는 중… ${filesDone}/${attachments.length}`, 1500);
+    if (await uploadFile(a.file, a.name)) filesDone++;
+  }
   scheduleRefresh(true);
-  notice(`${done}개를 가져왔습니다${renamed ? ` · 이름이 겹친 ${renamed}개는 "제목 (폴더)"로 바꿨습니다` : ''}`, 6000);
+  notice(`노트 ${done}개${attachments.length ? `, 첨부 ${filesDone}/${attachments.length}개` : ''}를 가져왔습니다${renamed ? ` · 이름이 겹친 ${renamed}개는 "제목 (폴더)"로 바꿨습니다` : ''}`, 6000);
 }
 
-function exportVault() {
+async function exportVault() {
   const entries = [...store.notes.values()].map((n) => ({
     path: (n.folder ? `${n.folder}/` : '') + `${n.title}.md`,
     text: n.content,
     date: new Date(n.updated_at),
   }));
+  let missing = 0;
+  for (const f of store.files.values()) {
+    const { data, error } = await sb.storage.from('brain-files').download(`${f.vault_id}/${f.id}`);
+    if (error || !data) { missing++; continue; }
+    entries.push({ path: (f.folder ? `${f.folder}/` : '') + f.name, data: new Uint8Array(await data.arrayBuffer()), date: new Date(f.created_at) });
+  }
+  if (missing) notice(`첨부 파일 ${missing}개는 내려받지 못해 빠졌습니다`, 6000);
   if (!entries.length) return notice('내보낼 노트가 없습니다');
   const a = el('a', { href: URL.createObjectURL(buildZip(entries)), download: `${store.vault.name}.zip` });
   document.body.append(a);
   a.click();
   a.remove();
-  notice(`노트 ${entries.length}개를 ZIP으로 내보냈습니다. 풀어서 Obsidian에서 폴더를 열면 됩니다`, 6000);
+  notice(`노트·첨부 ${entries.length}개를 ZIP으로 내보냈습니다. 풀어서 Obsidian에서 폴더를 열면 됩니다`, 6000);
 }
 
 function runCommand(id) { COMMANDS.find((c) => c.id === id)?.run(); }
@@ -2433,6 +2558,11 @@ function subscribeRealtime() {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'brain_folders', filter }, async () => {
       await reloadFolders();
       scheduleRefresh();
+    })
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'brain_files', filter }, async () => {
+      await loadFiles();
+      scheduleRefresh(true);
+      for (const t of tabs) if (t.kind === 'note' && t.mode === 'preview') renderReading(t);
     })
     .on('postgres_changes', { event: '*', schema: 'public', table: 'brain_members', filter }, async () => {
       await loadMembers();

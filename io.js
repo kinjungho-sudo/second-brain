@@ -1,6 +1,8 @@
 // 가져오기·내보내기. Obsidian 보관함은 .md 파일이 든 폴더이므로 폴더를 그대로 읽고, ZIP으로 내보낸다.
 
-const BAD = /[[\]|#^\\/:]/g;
+import { kindOf } from './files.js';
+
+const BAD =/[[\]|#^\\/:]/g;
 const clean = (s) => s.replace(BAD, '-').trim();
 
 // 'a/b/c.md' → { title: 'c', folder: 'a/b' } (보관함에서 허용하지 않는 글자는 '-'로 바꾼다)
@@ -18,16 +20,22 @@ export function flattenLinks(text) {
 // 선택한 폴더의 File 목록 → 가져올 노트 목록. 첫 경로(폴더 이름)는 떼고, 숨김 폴더(.obsidian 등)는 건너뛴다.
 export async function readVaultFiles(files) {
   const notes = [];
+  const attachments = [];
   let skipped = 0;
   for (const f of files) {
     const rel = (f.webkitRelativePath || f.name).split('/').slice(f.webkitRelativePath ? 1 : 0);
     if (rel.some((p) => p.startsWith('.'))) continue;
-    if (!/\.md$/i.test(f.name)) { skipped++; continue; }
+    if (!/\.md$/i.test(f.name)) {
+      // 이미지·PDF·오디오·비디오는 첨부 파일로 가져온다 (나머지는 건너뜀)
+      if (kindOf(f.name)) attachments.push({ name: clean(f.name), file: f });
+      else skipped++;
+      continue;
+    }
     const { title, folder } = splitPath(rel.join('/'));
     if (!title) { skipped++; continue; }
     notes.push({ title, folder, content: flattenLinks((await f.text()).replace(/\r\n?/g, '\n')) });
   }
-  return { notes, skipped };
+  return { notes, attachments, skipped };
 }
 
 // 이름이 겹치면 "제목 (폴더)" → "제목 (폴더) 2" 순으로 바꾼다. taken은 소문자 키 Set.
@@ -59,7 +67,7 @@ export function buildZip(entries /* [{ path, text, date }] */) {
   let offset = 0;
   for (const e of entries) {
     const name = enc.encode(e.path);
-    const data = enc.encode(e.text);
+    const data = e.data || enc.encode(e.text);
     const d = e.date || new Date();
     const time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
     const day = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();

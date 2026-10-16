@@ -1,6 +1,7 @@
 // 읽기 화면용 마크다운 렌더러: [[링크]], ![[임베드]], ==형광펜==, #태그, 콜아웃, 체크박스
 import { marked, DOMPurify } from './vendor.js';
 import { frontmatterTags } from './props.js';
+import { isAttachmentName, renderAttachment } from './files.js';
 
 export const WIKILINK_RE = /(!?)\[\[([^\]|#^\n]+)([#^][^\]|\n]*)?(?:\|([^\]\n]*))?\]\]/g;
 // 태그: 공백(또는 줄 처음) 뒤의 #, 숫자만으로 된 것은 제외 (Obsidian 규칙)
@@ -29,7 +30,7 @@ marked.use({
         return { type: 'wikilink', raw: m[0], embed: !!m[1], target: m[2].trim(), sub: (m[3] || '').slice(1).trim(), alias: m[4]?.trim() };
       },
       renderer(t) {
-        const attrs = `data-target="${escapeHtml(t.target)}" data-sub="${escapeHtml(t.sub)}"`;
+        const attrs = `data-target="${escapeHtml(t.target)}" data-sub="${escapeHtml(t.sub)}" data-alias="${escapeHtml(t.alias || '')}"`;
         if (t.embed) return `<span class="internal-embed" ${attrs}></span>`;
         const label = t.alias || (t.sub ? `${t.target} > ${t.sub}` : t.target);
         return `<a class="internal-link" ${attrs}>${escapeHtml(label)}</a>`;
@@ -143,7 +144,7 @@ const CALLOUT_ICONS = {
  */
 export function renderInto(el, src, ctx) {
   const html = marked.parse(stripFrontmatter(src || ''));
-  el.innerHTML = DOMPurify.sanitize(html, { ADD_ATTR: ['data-target', 'data-sub', 'data-tag', 'data-heading'] });
+  el.innerHTML = DOMPurify.sanitize(html, { ADD_ATTR: ['data-target', 'data-sub', 'data-alias', 'data-tag', 'data-heading'] });
   hydrate(el, ctx);
 }
 
@@ -210,6 +211,14 @@ function hydrate(el, ctx) {
   // 임베드 ![[노트]]
   const depth = ctx.depth || 0;
   for (const span of el.querySelectorAll('span.internal-embed')) {
+    if (isAttachmentName(span.dataset.target)) {
+      const att = document.createElement('div');
+      renderAttachment(att, span.dataset.target, ctx.attachment?.(span.dataset.target) || null, ctx.fileUrl, span.dataset.alias);
+      const pp = span.parentElement;
+      if (pp?.tagName === 'P' && pp.childNodes.length === 1) pp.replaceWith(att);
+      else span.replaceWith(att);
+      continue;
+    }
     const note = ctx.resolve(span.dataset.target);
     const box = document.createElement('div');
     box.className = 'markdown-embed';

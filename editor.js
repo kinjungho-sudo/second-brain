@@ -12,6 +12,7 @@ import {
 } from './vendor.js';
 import { renderInto, sectionOf } from './render.js';
 import { parseFrontmatter, serializeFrontmatter, renderProps } from './props.js';
+import { isAttachmentName, renderAttachment } from './files.js';
 
 const refreshEffect = StateEffect.define();
 
@@ -89,6 +90,18 @@ class LinkWidget extends WidgetType {
   ignoreEvent(e) { return e.type === 'mousedown' || e.type === 'click'; }
 }
 
+class AttachWidget extends WidgetType {
+  constructor(target, alias, ctx, fileId) { super(); Object.assign(this, { target, alias, ctx, fileId }); }
+  eq(o) { return o.target === this.target && o.alias === this.alias && o.fileId === this.fileId; }
+  toDOM() {
+    const box = document.createElement('div');
+    box.className = 'cm-attachment';
+    renderAttachment(box, this.target, this.ctx.attachment?.(this.target) || null, this.ctx.fileUrl, this.alias);
+    return box;
+  }
+  ignoreEvent() { return false; }
+}
+
 class EmbedWidget extends WidgetType {
   constructor(target, sub, ctx, version) {
     super();
@@ -114,7 +127,7 @@ class EmbedWidget extends WidgetType {
     head.append(a);
     const body = document.createElement('div');
     body.className = 'markdown-embed-content markdown-rendered';
-    renderInto(body, sectionOf(note.content || '', this.sub), { resolve: this.ctx.resolve, depth: 1 });
+    renderInto(body, sectionOf(note.content || '', this.sub), { resolve: this.ctx.resolve, attachment: this.ctx.attachment, fileUrl: this.ctx.fileUrl, depth: 1 });
     box.append(head, body);
     return box;
   }
@@ -336,7 +349,11 @@ function buildDecorations(view, ctx) {
       if (inCode(s)) continue;
       const target = m[2].trim();
       const sub = (m[3] || '').slice(1).trim();
-      const resolved = !!ctx.resolve(target);
+      const resolved = !!ctx.resolve(target) || (isAttachmentName(target) && !!ctx.attachment?.(target));
+      if (m[1] && isAttachmentName(target) && !touched(s, e)) {
+        decos.push(Decoration.replace({ widget: new AttachWidget(target, m[4]?.trim() || '', ctx, ctx.attachment?.(target)?.id ?? '') }).range(s, e));
+        continue;
+      }
       if (m[1] && !touched(s, e)) {
         const l = state.doc.lineAt(s);
         const whole = l.text.trim() === m[0];
@@ -488,6 +505,13 @@ function toggleCheckbox(view) {
  * ctx: { resolve(title), notes(), tags(), headings(note), version(), onChange(text),
  *        onOpenLink(target, sub, newTab), onTag(tag), onHover(el, target, sub) }
  */
+function insertEmbeds(view, names, from, to) {
+  if (!names?.length) return;
+  const text = names.map((n) => `![[${n}]]`).join('\n');
+  view.dispatch({ changes: { from, to, insert: text }, selection: { anchor: from + text.length } });
+  view.focus();
+}
+
 export function createEditor(parent, doc, ctx) {
   const editable = new Compartment();
   let silent = false;
@@ -531,6 +555,21 @@ export function createEditor(parent, doc, ctx) {
         return true;
       }
       return false;
+    },
+    paste(e, view) {
+      const files = [...(e.clipboardData?.files || [])];
+      if (!files.length || !ctx.onFiles) return false;
+      e.preventDefault();
+      ctx.onFiles(files, 'paste').then((names) => insertEmbeds(view, names, view.state.selection.main.from, view.state.selection.main.to));
+      return true;
+    },
+    drop(e, view) {
+      const files = [...(e.dataTransfer?.files || [])];
+      if (!files.length || !ctx.onFiles) return false;
+      e.preventDefault();
+      const pos = view.posAtCoords({ x: e.clientX, y: e.clientY }) ?? view.state.selection.main.head;
+      ctx.onFiles(files, 'drop').then((names) => insertEmbeds(view, names, pos, pos));
+      return true;
     },
     mouseover(e) {
       const el = e.target.closest?.('.cm-wikilink, .cm-wikilink-source');
