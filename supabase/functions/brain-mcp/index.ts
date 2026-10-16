@@ -350,7 +350,9 @@ async function callTool(ctx: Ctx, name: string, a: any): Promise<string> {
       const inbound = new Map<string, number>();
       for (const n of notes) for (const k of n.link_keys || []) inbound.set(k, (inbound.get(k) || 0) + 1);
       const scope = folder ? notes.filter((n) => n.folder === folder || n.folder.startsWith(folder + '/')) : notes;
-      const broken = scope.flatMap((n) => [...new Set(linksIn(n.content))].filter((t) => !exists.has(keyOf(t))).map((t) => `- [[${n.title}]] → [[${t}]]`));
+      // 첨부 파일(![[그림.png]] 등)은 노트가 아니므로 끊긴 링크로 세지 않는다
+      const ATTACH = /\.(bmp|png|jpe?g|gif|svg|webp|avif|mp3|wav|m4a|3gp|flac|ogg|oga|opus|mp4|webm|ogv|mov|mkv|pdf)$/i;
+      const broken = scope.flatMap((n) => [...new Set(linksIn(n.content))].filter((t) => !exists.has(keyOf(t)) && !ATTACH.test(t.trim())).map((t) => `- [[${n.title}]] → [[${t}]]`));
       const skip = new Set(['index', 'log', ...RULES_TITLES]);
       const orphans = scope.filter((n) => !inbound.get(keyOf(n.title)) && !skip.has(keyOf(n.title))).map((n) => `- ${n.title}${n.folder ? ` [${n.folder}]` : ''}`);
       const empty = scope.filter((n) => !n.content.trim()).map((n) => `- ${n.title}`);
