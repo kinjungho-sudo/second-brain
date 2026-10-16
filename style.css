@@ -939,3 +939,30 @@ body.is-readonly [data-cmd="new-note"], body.is-readonly [data-cmd="new-folder"]
 .agent-help summary { cursor: pointer; color: var(--text-accent); font-size: 13px; }
 .history-agent { font-size: 11px; color: var(--text-muted); background: var(--background-modifier-hover); border-radius: 8px; padding: 0 6px; }
 .nav-file-tag.is-agent { border: none; font-size: 11px; }
+
+/* ---------- 속성 (YAML 앞머리) ---------- */
+.properties { margin: 0 0 16px; border-bottom: 1px solid var(--background-modifier-border); padding-bottom: 8px; font-size: 0.9em; }
+.cm-properties { margin-bottom: 8px; }
+.properties-header { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text-muted); user-select: none; padding: 2px 0; }
+.properties-header:hover { color: var(--text-normal); }
+.properties-count { font-size: 0.8em; color: var(--text-faint); }
+.properties-body { margin-top: 4px; }
+.properties-row { display: flex; align-items: flex-start; gap: 8px; padding: 2px 0; }
+.properties-row .properties-key { flex: 0 0 140px; width: 140px; color: var(--text-muted); }
+.properties-row input.properties-key, .properties-value, .properties-chip-input { background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 2px 6px; color: var(--text-normal); font: inherit; }
+.properties-row input.properties-key { color: var(--text-muted); }
+.properties-row input:hover, .properties-row input:focus { border-color: var(--background-modifier-border); outline: none; }
+.properties-val { flex: 1; min-width: 0; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+input.properties-value { width: 100%; }
+.properties-chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.properties-chip { display: inline-flex; align-items: center; gap: 2px; background: var(--background-modifier-hover, rgba(127,127,127,.15)); border-radius: 12px; padding: 1px 4px 1px 10px; }
+.properties-chip > span { cursor: default; }
+.properties-chip-x, .properties-del { background: none; border: none; color: var(--text-faint); cursor: pointer; padding: 0 4px; font-size: 1.1em; line-height: 1; box-shadow: none; }
+.properties-chip-x:hover, .properties-del:hover { color: var(--text-normal); }
+.properties-del { opacity: 0; }
+.properties-row:hover .properties-del { opacity: 1; }
+.properties-chip-input { width: 90px; }
+.properties-raw { white-space: pre-wrap; color: var(--text-faint); font-size: 0.9em; }
+.properties-add { margin-top: 4px; }
+.properties-add .properties-val button { padding: 2px 10px; }
+.reading-properties { margin-bottom: 8px; }

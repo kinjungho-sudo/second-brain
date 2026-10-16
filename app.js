@@ -6,6 +6,8 @@ import { renderInto, headingsOf, tagsOf, stripCode, toggleTask, escapeHtml, WIKI
 import { createGraph } from './graph.js';
 import { icon } from './icons.js';
 import { DEFAULT_RULES } from './wiki-rules.js';
+import { readVaultFiles, dedupe, buildZip } from './io.js';
+import { parseFrontmatter, renderProps } from './props.js';
 import { SUPABASE_URL } from './config.js';
 
 // 공개 키(publishable)만 사용한다. 실제 접근 통제는 DB의 RLS가 담당한다.
@@ -1171,6 +1173,12 @@ function renderReading(tab) {
     resolve: resolveNote,
     onToggleTask: (i, checked) => updateNoteContent(id, toggleTask(textOf(id), i, checked)),
   });
+  const fm = parseFrontmatter(textOf(id));
+  if (fm) {
+    const box = el('div', { class: 'reading-properties' });
+    renderProps(box, fm, { onTag: (t) => searchFor(`tag:#${t}`) });
+    tab.reading.prepend(box);
+  }
 }
 
 function scrollToHeading(tab, sub) {
@@ -1186,6 +1194,7 @@ function showNoteMenu(e, tab) {
   const id = tab.noteId;
   showMenu(e, [
     { label: tab.mode === 'preview' ? '편집 보기' : '읽기 보기', icon: tab.mode === 'preview' ? 'pencil' : 'book-open', action: () => toggleMode(tab) },
+    { label: '속성 추가', icon: 'list', action: () => addProperties(tab) },
     { label: '이름 바꾸기', icon: 'edit', action: () => focusTitle(tab) },
     { label: '다른 폴더로 이동…', icon: 'move', action: () => pickFolderAndMove(id) },
     { label: '[[링크]] 복사', icon: 'copy', action: () => copyText(`[[${store.notes.get(id).title}]]`) },
@@ -1194,6 +1203,13 @@ function showNoteMenu(e, tab) {
     '-',
     { label: '보관', icon: 'archive', danger: true, action: () => archiveNote(id) },
   ]);
+}
+
+function addProperties(tab = activeTab) {
+  if (tab?.kind !== 'note' || !canWrite()) return;
+  if (tab.mode === 'preview') setMode(tab, 'source');
+  if (tab.editor?.hasProps()) return notice('이미 속성이 있습니다', 1500);
+  tab.editor?.addProps();
 }
 
 function focusTitle(tab = activeTab) {
@@ -1927,6 +1943,7 @@ const COMMANDS = [
   { id: 'graph', name: '그래프 뷰 열기', hotkey: 'Ctrl+G', run: () => openGraph() },
   { id: 'daily', name: '오늘의 데일리 노트 열기', hotkey: 'Alt+D', run: () => openDaily() },
   { id: 'toggle-mode', name: '읽기 / 편집 보기 전환', hotkey: 'Ctrl+E', run: () => toggleMode() },
+  { id: 'add-props', name: '현재 노트에 속성 추가', run: () => addProperties() },
   { id: 'rename', name: '현재 노트 이름 바꾸기', hotkey: 'F2', run: () => focusTitle() },
   { id: 'move', name: '현재 노트를 다른 폴더로 이동', run: () => activeNoteId() && pickFolderAndMove(activeNoteId()) },
   { id: 'copy-link', name: '현재 노트의 [[링크]] 복사', run: () => activeNoteId() && copyText(`[[${store.notes.get(activeNoteId()).title}]]`) },
@@ -1949,9 +1966,58 @@ const COMMANDS = [
   { id: 'members', name: '멤버와 초대 관리', run: () => openMembers() },
   { id: 'agents', name: 'AI 에이전트 연결 (Claude Code · Codex · Hermes)', run: () => openAgents() },
   { id: 'wiki-setup', name: 'LLM 위키 시작하기 (규칙·index·log 만들기)', run: () => setupLlmWiki() },
+  { id: 'import', name: 'Obsidian 보관함 가져오기 (폴더 선택)', run: () => importVault() },
+  { id: 'export', name: '보관함을 .md ZIP으로 내보내기', run: () => exportVault() },
   { id: 'switch-vault', name: '다른 보관함 열기 / 새 보관함 만들기', run: () => switchVault() },
   { id: 'logout', name: '로그아웃', run: () => logout() },
 ];
+
+// ---------- 가져오기 · 내보내기 ----------
+function pickFiles({ folder = false } = {}) {
+  return new Promise((resolve) => {
+    const input = el('input', { type: 'file', multiple: true, accept: folder ? null : '.md', style: 'display:none' });
+    if (folder) input.setAttribute('webkitdirectory', '');
+    input.onchange = () => { resolve([...input.files]); input.remove(); };
+    document.body.append(input);
+    input.click();
+  });
+}
+
+async function importVault() {
+  if (!canWrite()) return notice('읽기 전용 보관함입니다');
+  const files = await pickFiles({ folder: true });
+  if (!files.length) return;
+  const { notes, skipped } = await readVaultFiles(files);
+  if (!notes.length) return notice('가져올 .md 노트가 없습니다');
+  const ok = await confirmModal({ title: 'Obsidian 보관함 가져오기', text: `노트 ${notes.length}개를 "${store.vault.name}"에 추가합니다.${skipped ? ` (이미지 등 .md가 아닌 파일 ${skipped}개는 건너뜁니다)` : ''}`, okText: '가져오기' });
+  if (!ok) return;
+  const renamed = dedupe(notes, new Set(store.byKey.keys()));
+  let done = 0;
+  for (let i = 0; i < notes.length; i += 50) {
+    const batch = notes.slice(i, i + 50).map((n) => ({ vault_id: store.vault.id, title: n.title, folder: n.folder, content: n.content }));
+    const { data, error } = await sb.from('brain_notes').insert(batch).select(COLS);
+    if (error) { notice(`${done}개까지 가져오고 멈췄습니다: ${error.message}`, 8000); break; }
+    data.forEach((row) => applyRow(row, { quiet: true }));
+    done += data.length;
+    notice(`가져오는 중… ${done}/${notes.length}`, 1500);
+  }
+  scheduleRefresh(true);
+  notice(`${done}개를 가져왔습니다${renamed ? ` · 이름이 겹친 ${renamed}개는 "제목 (폴더)"로 바꿨습니다` : ''}`, 6000);
+}
+
+function exportVault() {
+  const entries = [...store.notes.values()].map((n) => ({
+    path: (n.folder ? `${n.folder}/` : '') + `${n.title}.md`,
+    text: n.content,
+    date: new Date(n.updated_at),
+  }));
+  if (!entries.length) return notice('내보낼 노트가 없습니다');
+  const a = el('a', { href: URL.createObjectURL(buildZip(entries)), download: `${store.vault.name}.zip` });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  notice(`노트 ${entries.length}개를 ZIP으로 내보냈습니다. 풀어서 Obsidian에서 폴더를 열면 됩니다`, 6000);
+}
 
 function runCommand(id) { COMMANDS.find((c) => c.id === id)?.run(); }
 
@@ -2043,6 +2109,9 @@ function openSettings() {
       row('보관함', `지금: ${store.vault.name} (${roleLabel(store.vault.role)})`, el('div', { class: 'setting-buttons' },
         el('button', { text: '멤버와 초대', onclick: () => openMembers() }),
         el('button', { text: '다른 보관함', onclick: () => switchVault() }))),
+      el('h3', { text: '가져오기 · 내보내기' }),
+      row('Obsidian에서 가져오기', 'Obsidian 보관함 폴더를 고르면 노트와 폴더 구조가 그대로 들어옵니다', el('button', { text: '폴더 선택', onclick: () => importVault() })),
+      row('내보내기', '모든 노트를 .md 파일 ZIP으로 받습니다. Obsidian에서 바로 열 수 있습니다', el('button', { text: 'ZIP 받기', onclick: () => exportVault() })),
       el('h3', { text: 'AI 에이전트 · LLM 위키' }),
       row('에이전트 연결', 'Claude Code, Codex, Hermes 같은 AI 에이전트가 이 보관함을 읽고 쓰게 합니다', el('button', { class: 'mod-cta', text: '연결 관리', onclick: () => openAgents() })),
       row('LLM 위키 시작하기', '에이전트용 규칙(AGENTS), index, log 노트와 원본/위키 폴더를 만듭니다', el('button', { text: '만들기', onclick: () => setupLlmWiki() })),

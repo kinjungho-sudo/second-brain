@@ -1,5 +1,6 @@
 // 읽기 화면용 마크다운 렌더러: [[링크]], ![[임베드]], ==형광펜==, #태그, 콜아웃, 체크박스
 import { marked, DOMPurify } from './vendor.js';
+import { frontmatterTags } from './props.js';
 
 export const WIKILINK_RE = /(!?)\[\[([^\]|#^\n]+)([#^][^\]|\n]*)?(?:\|([^\]\n]*))?\]\]/g;
 // 태그: 공백(또는 줄 처음) 뒤의 #, 숫자만으로 된 것은 제외 (Obsidian 규칙)
@@ -83,12 +84,7 @@ export function tagsOf(src) {
   for (const line of stripCode(src).split('\n')) {
     for (const m of line.matchAll(TAG_RE)) out.add(m[2]);
   }
-  // YAML 앞머리의 tags: [a, b] 도 인식
-  const fm = /^---\n([\s\S]*?)\n---/.exec(src);
-  if (fm) {
-    const t = /^tags:\s*(.*)$/m.exec(fm[1]);
-    if (t) t[1].replace(/[[\]]/g, '').split(/[,\s]+/).filter(Boolean).forEach((x) => out.add(x.replace(/^#/, '')));
-  }
+  frontmatterTags(src).forEach((x) => out.add(x));
   return [...out];
 }
 

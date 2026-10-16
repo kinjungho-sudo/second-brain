@@ -1,7 +1,7 @@
 // CodeMirror 6 편집기 + Obsidian식 Live Preview
 // 커서가 닿지 않은 곳의 마크다운 기호를 숨기고 링크·체크박스·임베드를 위젯으로 보여준다.
 import {
-  EditorState, StateEffect, Compartment, Prec,
+  EditorState, StateEffect, StateField, Compartment, Prec,
   EditorView, keymap, Decoration, ViewPlugin, WidgetType, placeholder, drawSelection, dropCursor,
   defaultKeymap, history, historyKeymap, indentWithTab,
   syntaxTree, syntaxHighlighting, HighlightStyle, indentOnInput, bracketMatching,
@@ -11,8 +11,65 @@ import {
   tags as t,
 } from './vendor.js';
 import { renderInto, sectionOf } from './render.js';
+import { parseFrontmatter, serializeFrontmatter, renderProps } from './props.js';
 
 const refreshEffect = StateEffect.define();
+
+// ---------- 속성(YAML 앞머리)을 표 위젯으로 ----------
+class PropsWidget extends WidgetType {
+  constructor(text, ctx) { super(); this.text = text; this.ctx = ctx; }
+  eq(o) { return o.text === this.text; }
+  draw(dom, view) {
+    const fm = parseFrontmatter(this.text);
+    if (!fm) return;
+    renderProps(dom, fm, {
+      editable: view.state.facet(EditorView.editable),
+      onTag: this.ctx.onTag,
+      mutate: (fn) => {
+        const cur = parseFrontmatter(view.state.doc.toString());
+        if (!cur) return;
+        fn(cur.entries);
+        view.dispatch({ changes: { from: 0, to: cur.to, insert: serializeFrontmatter(cur.entries) }, userEvent: 'input.props' });
+      },
+    });
+  }
+  toDOM(view) { const d = document.createElement('div'); d.className = 'cm-properties'; this.draw(d, view); return d; }
+  updateDOM(dom, view) {
+    if (dom.contains(document.activeElement)) return true; // 입력 중이면 그대로 둔다
+    this.draw(dom, view);
+    return true;
+  }
+  ignoreEvent() { return true; }
+}
+
+function propsDecos(state, ctx) {
+  const text = state.doc.toString();
+  const fm = parseFrontmatter(text);
+  if (!fm) return { set: Decoration.none, to: -1 };
+  const set = Decoration.set([Decoration.replace({ widget: new PropsWidget(text.slice(0, fm.to), ctx), block: true }).range(0, fm.to)]);
+  return { set, to: fm.to };
+}
+
+function propsField(ctx) {
+  return StateField.define({
+    create: (state) => propsDecos(state, ctx),
+    update: (v, tr) => (tr.docChanged ? propsDecos(tr.state, ctx) : v),
+    provide: (f) => [EditorView.decorations.from(f, (v) => v.set), EditorView.atomicRanges.of((view) => view.state.field(f).set)],
+  });
+}
+
+// 커서가 속성 영역 안(또는 맨 앞)에 놓이면 본문 첫 줄로 옮긴다
+const keepOutOfProps = (field) => EditorView.updateListener.of((u) => {
+  const { to } = u.state.field(field);
+  if (to < 0) return;
+  const head = u.state.selection.main.head;
+  if (head > to) return;
+  queueMicrotask(() => {
+    const len = u.view.state.doc.length;
+    if (len === to) u.view.dispatch({ changes: { from: len, insert: '\n' }, selection: { anchor: len + 1 } });
+    else if (u.view.state.selection.main.head <= to) u.view.dispatch({ selection: { anchor: to + 1 } });
+  });
+});
 
 // ---------- 위젯 ----------
 class LinkWidget extends WidgetType {
@@ -482,6 +539,8 @@ export function createEditor(parent, doc, ctx) {
     },
   });
 
+  const propsF = propsField(ctx);
+  const propsExt = propsF;
   const state = EditorState.create({
     doc,
     extensions: [
@@ -500,6 +559,8 @@ export function createEditor(parent, doc, ctx) {
       placeholder('내용을 입력하세요. [[ 를 입력하면 다른 노트를 연결합니다.'),
       editable.of(EditorView.editable.of(true)),
       livePreview(ctx),
+      propsExt,
+      keepOutOfProps(propsF),
       clickHandler,
       Prec.high(keymap.of([
         { key: 'Mod-b', run: wrapWith('**') },
@@ -515,6 +576,11 @@ export function createEditor(parent, doc, ctx) {
   });
 
   const view = new EditorView({ state, parent });
+  {
+    const to = view.state.field(propsF).to;
+    if (to >= 0 && view.state.doc.length > to) view.dispatch({ selection: { anchor: to + 1 } });
+    else if (to >= 0) view.dispatch({ changes: { from: to, insert: '\n' }, selection: { anchor: to + 1 } });
+  }
 
   return {
     view,
@@ -546,6 +612,12 @@ export function createEditor(parent, doc, ctx) {
     insertAtCursor(text) {
       const r = view.state.selection.main;
       view.dispatch({ changes: { from: r.from, to: r.to, insert: text }, selection: { anchor: r.from + text.length } });
+      view.focus();
+    },
+    hasProps() { return view.state.field(propsF).to >= 0; },
+    addProps() {
+      if (view.state.field(propsF).to >= 0) return;
+      view.dispatch({ changes: { from: 0, insert: '---\n---\n' }, selection: { anchor: 8 } });
       view.focus();
     },
     destroy() { view.destroy(); },
