@@ -2340,6 +2340,11 @@ function openSettings() {
   };
   const toggle = (key) => el('input', { type: 'checkbox', class: 'toggle', checked: settings[key] || null, onchange: (e) => { settings[key] = e.target.checked; saveSettings(); applySettings(); } });
   const daily = el('input', { type: 'text', value: settings.dailyFolder, onchange: (e) => { settings.dailyFolder = e.target.value.trim(); saveSettings(); } });
+  // 보관함 삭제: 이 보관함을 만든 소유자에게만 보임 (DB 함수도 같은 조건으로 막음)
+  const delRow = el('div', {});
+  sb.rpc('brain_can_delete_vault', { p_vault: store.vault.id }).then(({ data }) => {
+    if (data === true) delRow.replaceChildren(row('보관함 삭제', '이 보관함의 노트·이력·첨부 파일을 모두 지웁니다. 되돌릴 수 없습니다', el('button', { class: 'mod-warning-outline', text: '삭제…', onclick: () => deleteVault() })));
+  });
   openModal({
     title: '설정',
     cls: 'mod-settings',
@@ -2369,6 +2374,7 @@ function openSettings() {
       row('보관함', `지금: ${store.vault.name} (${roleLabel(store.vault.role)})`, el('div', { class: 'setting-buttons' },
         el('button', { text: '멤버와 초대', onclick: () => openMembers() }),
         el('button', { text: '다른 보관함', onclick: () => switchVault() }))),
+      delRow,
       el('h3', { text: '가져오기 · 내보내기' }),
       row('Obsidian에서 가져오기', 'Obsidian 보관함 폴더를 고르면 노트와 폴더 구조가 그대로 들어옵니다', el('button', { text: '폴더 선택', onclick: () => importVault() })),
       row('내보내기', '모든 노트를 .md 파일 ZIP으로 받습니다. Obsidian에서 바로 열 수 있습니다', el('button', { text: 'ZIP 받기', onclick: () => exportVault() })),
@@ -2377,6 +2383,28 @@ function openSettings() {
       row('LLM 위키 시작하기', '에이전트용 규칙(AGENTS), index, log 노트와 원본/위키 폴더를 만듭니다', el('button', { text: '만들기', onclick: () => setupLlmWiki() })),
       row(store.user.email, null, el('button', { text: '로그아웃', onclick: () => logout() }))),
   });
+}
+
+async function deleteVault() {
+  const v = store.vault;
+  const { data: can } = await sb.rpc('brain_can_delete_vault', { p_vault: v.id });
+  if (can !== true) return notice('이 보관함을 만든 소유자만 삭제할 수 있습니다', 4000);
+  const typed = await promptText({ title: '보관함 삭제', value: '', placeholder: `삭제하려면 "${v.name}" 을(를) 똑같이 입력하세요` });
+  if (typed === null || typed === undefined) return;
+  if (typed.trim() !== v.name) return notice('보관함 이름이 달라서 삭제하지 않았습니다', 4000);
+  if (!(await confirmModal({ title: '정말 삭제할까요?', text: `"${v.name}"의 노트 ${store.notes.size}개와 첨부 파일이 모두 지워지고 되돌릴 수 없습니다. 이 보관함에 연결된 AI 열쇠도 사라집니다.`, okText: '영구 삭제', danger: true }))) return;
+  await flushAll();
+  // 저장소 파일 먼저 (삭제 후에는 권한이 없어 지울 수 없음)
+  for (;;) {
+    const { data: objs } = await sb.storage.from('brain-files').list(v.id, { limit: 100 });
+    if (!objs?.length) break;
+    const { error: re } = await sb.storage.from('brain-files').remove(objs.map((o) => `${v.id}/${o.name}`));
+    if (re) return notice('첨부 파일을 지우지 못해 삭제를 중단했습니다', 5000);
+  }
+  const { error } = await sb.rpc('brain_delete_vault', { p_vault: v.id, p_name: v.name });
+  if (error) return notice('삭제하지 못했습니다: ' + error.message, 5000);
+  try { localStorage.removeItem('sb.vault'); } catch {}
+  location.reload();
 }
 
 // ---------- 보관함 전환 / 멤버와 초대 ----------
