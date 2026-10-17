@@ -2434,7 +2434,7 @@ function agentSetupGuide(token) {
       el('button', { class: 'small-button', text: '복사', onclick: () => copyText(code) })));
   return el('div', { class: 'agent-guides' },
     block('Claude Code', '터미널에서 한 번 실행하세요.', `claude mcp add --transport http second-brain ${MCP_URL} --header "Authorization: Bearer ${tk}"`),
-    block('Codex', '~/.codex/config.toml 에 추가하세요.', `[mcp_servers.second-brain]\nurl = "${MCP_URL}"\nhttp_headers = { "Authorization" = "Bearer ${tk}" }`),
+    block('Codex (ChatGPT 요금제로 로그인한 Codex CLI)', 'OpenAI API 키는 필요 없습니다. 열쇠를 환경변수 SECOND_BRAIN_KEY에 넣고(Windows: setx SECOND_BRAIN_KEY 열쇠), ~/.codex/config.toml 에 아래를 추가하세요. 마지막 줄은 도구 호출을 묻지 않고 허용합니다(선택).', `[mcp_servers.second-brain]\nurl = "${MCP_URL}"\nbearer_token_env_var = "SECOND_BRAIN_KEY"\ndefault_tools_approval_mode = "approve"${token ? `\n\n# 열쇠 값(한 번만 보입니다): ${tk}` : ''}`),
     block('Hermes Agent', '~/.hermes/config.yaml 의 mcp_servers 에 추가하세요.', `mcp_servers:\n  second-brain:\n    url: "${MCP_URL}"\n    headers:\n      Authorization: "Bearer ${tk}"`),
     block('그 밖의 MCP 앱 (Claude Desktop, Cursor 등)', 'mcpServers 설정에 추가하세요.', JSON.stringify({ mcpServers: { 'second-brain': { type: 'http', url: MCP_URL, headers: { Authorization: `Bearer ${tk}` } } } }, null, 2)),
     el('div', { class: 'muted small', text: '연결한 뒤 에이전트에게 "second-brain의 wiki_guide를 읽고 이 자료를 위키에 넣어줘"처럼 말하면 됩니다. 설정 형식은 에이전트 버전에 따라 조금 다를 수 있습니다.' }));

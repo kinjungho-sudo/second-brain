@@ -2,12 +2,16 @@
 // 인증은 앱 설정에서 만든 "에이전트 열쇠"(Bearer 토큰). 열쇠마다 한 보관함, 한 사람의 권한으로만 동작한다.
 // MCP Streamable HTTP(JSON 응답) 방식: POST 한 번에 JSON-RPC 요청/응답.
 import { createClient } from 'npm:@supabase/supabase-js@2.45.4';
+// 앱(브라우저)과 같은 규칙을 쓰기 위해 앱의 모듈을 그대로 가져온다 (속성 YAML, 템플릿 변수, 첨부 규칙)
+import { parseFrontmatter, serializeFrontmatter } from './props.js';
+import { applyVars } from './templates.js';
+import { kindOf, cleanName, availableName, mimeOf } from './files.js';
 
 const sb = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!, {
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
-const SERVER = { name: 'second-brain', version: '1.0.0' };
+const SERVER = { name: 'second-brain', version: '1.1.0' };
 const PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const COLS = 'id,title,folder,content,version,link_keys,updated_at,updated_by,updated_via,created_at';
 const RULES_TITLES = ['agents', '위키 규칙', '규칙'];
@@ -55,6 +59,7 @@ const DEFAULT_RULES = `# LLM 위키 규칙 (기본값)
 - 고치기 전에 \`read_note\`로 version을 확인하고 \`expected_version\`을 넘깁니다. (다른 사람이 먼저 고쳤으면 실패하니 다시 읽고 합칩니다.)
 - 사람이 쓴 문장은 함부로 지우지 않습니다. 고칠 때는 덧붙이거나 다듬습니다.
 - 링크는 제목만 씁니다: [[페이지 제목]], [[페이지 제목#소제목]], [[페이지 제목|보이는 글자]]
+- 속성(맨 위 YAML)은 \`get_properties\`/\`set_properties\`, 첨부 파일은 \`list_attachments\`/\`add_attachment\`, 템플릿은 \`list_templates\`/\`create_from_template\` 도구를 씁니다.
 - 한국어로 씁니다.
 `;
 
@@ -128,6 +133,36 @@ const ATTACH = /\.(bmp|png|jpe?g|gif|svg|webp|avif|mp3|wav|m4a|3gp|flac|ogg|oga|
 const linksIn = (content: string) =>
   [...content.matchAll(/(!?)\[\[([^\]|#^\n]+)([#^][^\]|\n]*)?(?:\|[^\]\n]*)?\]\]/g)].map((m) => m[2].trim()).filter((t) => !ATTACH.test(t));
 
+// ---------- 속성 · 템플릿 · 첨부 도움 함수 ----------
+const DATE_RE = /^\d{4}-[01]\d-[0-3]\d$/;
+const DATETIME_RE = /^\d{4}-[01]\d-[0-3]\dT[0-2]\d:[0-5]\d$/;
+const LIST_KEYS = new Set(['tags', 'aliases', 'cssclasses']);
+const MAX_MCP_FILE = 10 * 1024 * 1024; // 에이전트가 JSON으로 올리는 파일은 10MB까지 (앱에서는 50MB)
+
+function entryFromValue(key: string, v: unknown) {
+  if (Array.isArray(v)) return { key, type: 'list', value: v.map((x) => String(x)) };
+  if (typeof v === 'boolean') return { key, type: 'checkbox', value: v };
+  if (typeof v === 'number') return { key, type: 'number', value: String(v) };
+  if (typeof v === 'string') {
+    if (LIST_KEYS.has(key.toLowerCase())) return { key, type: 'list', value: [v] };
+    return { key, type: DATE_RE.test(v) ? 'date' : DATETIME_RE.test(v) ? 'datetime' : 'text', value: v };
+  }
+  throw new ToolError(`"${key}" 값은 글자·숫자·true/false·목록만 쓸 수 있습니다.`);
+}
+
+const entryToJson = (e: any) => (e.type === 'raw' ? { key: e.key || '(원문)', type: 'raw', value: e.lines.join('\n') } : { key: e.key, type: e.type, value: e.type === 'number' ? Number(e.value) : e.value });
+
+async function templateNotes(ctx: Ctx, folderArg?: unknown) {
+  const notes = await allNotes(ctx, 'title,folder,content');
+  const given = folderArg === undefined ? '' : normFolder(folderArg);
+  const folder = given || ['Templates', '템플릿'].find((f) => notes.some((n) => n.folder === f || n.folder.startsWith(f + '/'))) || '';
+  if (!folder) throw new ToolError('템플릿 폴더를 찾지 못했습니다. "Templates" 또는 "템플릿" 폴더에 템플릿 노트를 만들거나 folder를 지정하세요.');
+  const list = notes.filter((n) => n.folder === folder || n.folder.startsWith(folder + '/'))
+    .map((n) => ({ ...n, path: `${n.folder === folder ? '' : n.folder.slice(folder.length + 1) + '/'}${n.title}` }))
+    .sort((a, b) => a.path.localeCompare(b.path, 'ko'));
+  return { folder, list };
+}
+
 // ---------- 도구 ----------
 const TOOLS = [
   {
@@ -200,6 +235,60 @@ const TOOLS = [
     name: 'find_problems',
     description: '위키 점검용: 끊긴 링크(없는 노트를 가리킴), 고아 노트(백링크 없음), 빈 노트를 찾아 돌려줍니다.',
     inputSchema: { type: 'object', properties: { folder: { type: 'string', description: '이 폴더만 점검. 비우면 전체' } } },
+  },
+  {
+    name: 'get_properties',
+    description: '노트의 속성(맨 위 YAML 앞머리)을 {key, type, value} 목록으로 돌려줍니다. type: text/list/number/checkbox/date/datetime/raw.',
+    inputSchema: { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] },
+  },
+  {
+    name: 'set_properties',
+    description:
+      '노트의 속성을 고칩니다(본문은 그대로). properties는 {키: 값} 객체: 글자/숫자/true·false/목록(배열) 값을 쓰고, null이면 그 속성을 지웁니다. 같은 키는 바뀌고 없는 키는 추가됩니다. 예: {"tags":["회의","2026"],"상태":"진행","완료":false}. expected_version을 넘기면 그사이 바뀐 경우 실패합니다.',
+    inputSchema: {
+      type: 'object',
+      properties: { title: { type: 'string' }, properties: { type: 'object' }, expected_version: { type: 'number' } },
+      required: ['title', 'properties'],
+    },
+  },
+  {
+    name: 'list_templates',
+    description: '템플릿 노트 목록. 기본은 "Templates" 또는 "템플릿" 폴더. 템플릿 안의 {{title}} {{date}} {{time}} {{date:형식}}은 만들 때 채워집니다.',
+    inputSchema: { type: 'object', properties: { folder: { type: 'string', description: '템플릿 폴더. 비우면 Templates/템플릿' } } },
+  },
+  {
+    name: 'create_from_template',
+    description: '템플릿으로 새 노트를 만듭니다. 변수({{title}} 등)가 채워진 상태로 저장됩니다. 같은 제목이 있으면 실패합니다.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        template: { type: 'string', description: 'list_templates에 나온 이름(하위 폴더면 "하위/이름")' },
+        title: { type: 'string', description: '새 노트 제목' },
+        folder: { type: 'string', description: '새 노트를 둘 폴더(선택)' },
+        template_folder: { type: 'string', description: '템플릿 폴더(선택)' },
+      },
+      required: ['template', 'title'],
+    },
+  },
+  {
+    name: 'list_attachments',
+    description: '첨부 파일(이미지·PDF·오디오·비디오) 목록. 노트에서는 ![[파일이름.png]] 로 넣습니다.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_attachment_url',
+    description: '첨부 파일을 내려받을 수 있는 임시 주소(1시간 유효)를 돌려줍니다.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string', description: '예: 회의사진.png' } }, required: ['name'] },
+  },
+  {
+    name: 'add_attachment',
+    description:
+      '첨부 파일을 올립니다(10MB까지). data_base64에 파일 내용을 base64로 넣으세요. 이미지 bmp png jpg jpeg gif svg webp avif / 오디오 mp3 wav m4a flac ogg opus / 비디오 mp4 webm mov mkv / pdf만 가능. 같은 이름이 있으면 "이름 1.png"처럼 번호가 붙습니다. 올린 뒤 노트에 ![[이름]] 을 넣으면 보입니다.',
+    inputSchema: {
+      type: 'object',
+      properties: { name: { type: 'string' }, data_base64: { type: 'string' }, folder: { type: 'string' } },
+      required: ['name', 'data_base64'],
+    },
   },
 ];
 
@@ -361,6 +450,95 @@ async function callTool(ctx: Ctx, name: string, a: any): Promise<string> {
         '', `## 고아 노트 ${orphans.length}개 (아무도 링크하지 않음)`, ...orphans.slice(0, 200),
         '', `## 빈 노트 ${empty.length}개`, ...empty.slice(0, 200),
       ].join('\n');
+    }
+
+    case 'get_properties': {
+      const n = await findNote(ctx, String(a.title || ''));
+      if (!n) throw new ToolError(`"${a.title}" 노트가 없습니다.`);
+      const fm = parseFrontmatter(n.content);
+      return JSON.stringify({ title: n.title, version: n.version, has_properties: !!fm, properties: (fm?.entries || []).map(entryToJson) }, null, 2);
+    }
+
+    case 'set_properties': {
+      requireWrite(ctx);
+      const n = await findNote(ctx, String(a.title || ''));
+      if (!n) throw new ToolError(`"${a.title}" 노트가 없습니다.`);
+      if (a.expected_version != null && Number(a.expected_version) !== n.version) {
+        throw new ToolError(`그사이 노트가 바뀌었습니다(지금 version ${n.version}, 기대 ${a.expected_version}). get_properties로 다시 읽으세요.`);
+      }
+      if (!a.properties || typeof a.properties !== 'object' || Array.isArray(a.properties)) throw new ToolError('properties는 {키: 값} 객체여야 합니다.');
+      const fm = parseFrontmatter(n.content);
+      const entries: any[] = fm ? fm.entries : [];
+      for (const [key, v] of Object.entries(a.properties)) {
+        if (!key.trim() || /[\n:]/.test(key)) throw new ToolError(`속성 이름이 올바르지 않습니다: "${key}"`);
+        const i = entries.findIndex((e) => e.type !== 'raw' && e.key === key);
+        if (v === null) { if (i >= 0) entries.splice(i, 1); continue; }
+        const e = entryFromValue(key, v);
+        if (i >= 0) entries[i] = e; else entries.push(e);
+      }
+      const block = entries.length ? serializeFrontmatter(entries) : '';
+      const rest = fm ? n.content.slice(fm.to).replace(/^\n/, '') : n.content;
+      const next = block ? `${block}\n${rest}` : rest;
+      const { data, error } = await sb.from('brain_notes').update({ content: next, updated_by: ctx.userId, updated_via: ctx.via }).eq('id', n.id).eq('version', n.version).select('title,version');
+      if (error) throw new ToolError(error.message);
+      if (!data?.length) throw new ToolError('저장하는 순간 다른 사람이 먼저 고쳤습니다. 다시 읽고 시도하세요.');
+      return `속성을 고쳤습니다: "${data[0].title}" · version ${data[0].version} · 속성 ${entries.length}개`;
+    }
+
+    case 'list_templates': {
+      const { folder, list } = await templateNotes(ctx, a.folder);
+      return `템플릿 폴더 "${folder}" · ${list.length}개\n${list.map((t) => `- ${t.path}`).join('\n') || '(없음)'}`;
+    }
+
+    case 'create_from_template': {
+      requireWrite(ctx);
+      const { list } = await templateNotes(ctx, a.template_folder);
+      const key = keyOf(String(a.template || ''));
+      const tpl = list.find((t) => keyOf(t.path) === key) || list.find((t) => keyOf(t.title) === key);
+      if (!tpl) throw new ToolError(`"${a.template}" 템플릿이 없습니다. list_templates로 확인하세요.`);
+      const title = String(a.title || '').trim();
+      const content = applyVars(tpl.content, { title }, {});
+      return await callTool(ctx, 'write_note', { title, content, folder: a.folder, mode: 'create' });
+    }
+
+    case 'list_attachments': {
+      const { data, error } = await sb.from('brain_files').select('name,folder,mime,size,created_at').eq('vault_id', ctx.vaultId).order('created_at', { ascending: false });
+      if (error) throw new ToolError(error.message);
+      const rows = (data || []).map((f) => `- ${f.name} · ${f.mime} · ${f.size}바이트 · ${f.created_at.slice(0, 16).replace('T', ' ')}`);
+      return `첨부 파일 ${rows.length}개\n${rows.join('\n') || '(없음)'}`;
+    }
+
+    case 'get_attachment_url': {
+      const want = keyOf(String(a.name || '').split('/').pop() || '');
+      const { data: files, error } = await sb.from('brain_files').select('id,name,vault_id').eq('vault_id', ctx.vaultId);
+      if (error) throw new ToolError(error.message);
+      const f = (files || []).find((x) => keyOf(x.name) === want);
+      if (!f) throw new ToolError(`"${a.name}" 첨부 파일이 없습니다. list_attachments로 확인하세요.`);
+      const { data, error: e2 } = await sb.storage.from('brain-files').createSignedUrl(`${f.vault_id}/${f.id}`, 3600);
+      if (e2 || !data) throw new ToolError('주소를 만들지 못했습니다.');
+      return `${f.name}\n${data.signedUrl}\n(1시간 동안 유효)`;
+    }
+
+    case 'add_attachment': {
+      requireWrite(ctx);
+      const wanted = cleanName(String(a.name || ''));
+      if (!kindOf(wanted)) throw new ToolError(`"${wanted}"은(는) 지원하지 않는 형식입니다 (이미지·오디오·비디오·PDF).`);
+      let bytes: Uint8Array;
+      try { bytes = Uint8Array.from(atob(String(a.data_base64 || '').replace(/^data:[^,]*,/, '').replace(/\s/g, '')), (c) => c.charCodeAt(0)); }
+      catch { throw new ToolError('data_base64가 올바른 base64가 아닙니다.'); }
+      if (!bytes.length) throw new ToolError('파일 내용이 비어 있습니다.');
+      if (bytes.length > MAX_MCP_FILE) throw new ToolError(`10MB를 넘는 파일은 에이전트로 올릴 수 없습니다(${bytes.length}바이트). 앱에서 올려 주세요.`);
+      const folder = a.folder === undefined ? '' : normFolder(a.folder);
+      if (folder && BAD_FOLDER.test(folder)) throw new ToolError('폴더 이름에는 [ ] | # ^ \\ 를 쓸 수 없습니다.');
+      const { data: existing } = await sb.from('brain_files').select('name').eq('vault_id', ctx.vaultId);
+      const taken = new Set((existing || []).map((f) => keyOf(f.name)));
+      const name = availableName(wanted, (n: string) => taken.has(keyOf(n)));
+      const id = crypto.randomUUID();
+      const up = await sb.storage.from('brain-files').upload(`${ctx.vaultId}/${id}`, bytes, { contentType: mimeOf(name), upsert: false });
+      if (up.error) throw new ToolError(`올리지 못했습니다: ${up.error.message}`);
+      const { error } = await sb.from('brain_files').insert({ id, vault_id: ctx.vaultId, name, folder, mime: mimeOf(name), size: bytes.length, created_by: ctx.userId });
+      if (error) { await sb.storage.from('brain-files').remove([`${ctx.vaultId}/${id}`]); throw new ToolError(error.message); }
+      return `올렸습니다: "${name}" (${bytes.length}바이트). 노트에 ![[${name}]] 를 넣으면 보입니다.`;
     }
   }
   throw new ToolError(`알 수 없는 도구: ${name}`);
