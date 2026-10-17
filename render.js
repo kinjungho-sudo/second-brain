@@ -1,7 +1,7 @@
 // 읽기 화면용 마크다운 렌더러: [[링크]], ![[임베드]], ==형광펜==, #태그, 콜아웃, 체크박스
 import { marked, DOMPurify } from './vendor.js';
 import { frontmatterTags } from './props.js';
-import { isAttachmentName, renderAttachment } from './files.js';
+import { isAttachmentName, isMediaName, renderAttachment } from './files.js';
 
 export const WIKILINK_RE = /(!?)\[\[([^\]|#^\n]+)([#^][^\]|\n]*)?(?:\|([^\]\n]*))?\]\]/g;
 // 태그: 공백(또는 줄 처음) 뒤의 #, 숫자만으로 된 것은 제외 (Obsidian 규칙)
@@ -211,7 +211,7 @@ function hydrate(el, ctx) {
   // 임베드 ![[노트]]
   const depth = ctx.depth || 0;
   for (const span of el.querySelectorAll('span.internal-embed')) {
-    if (isAttachmentName(span.dataset.target)) {
+    if (isMediaName(span.dataset.target) || (isAttachmentName(span.dataset.target) && ctx.attachment?.(span.dataset.target))) {
       const att = document.createElement('div');
       renderAttachment(att, span.dataset.target, ctx.attachment?.(span.dataset.target) || null, ctx.fileUrl, span.dataset.alias);
       const pp = span.parentElement;

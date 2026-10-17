@@ -10,11 +10,18 @@ const PDF = ['pdf'];
 export const MAX_FILE_SIZE = 50 * 1024 * 1024;
 
 export const extOf = (name) => { const m = /\.([^./\\]+)$/.exec(String(name || '')); return m ? m[1].toLowerCase() : ''; };
+// 화면에 바로 보여 주는 형식(image·audio·video·pdf)이면 그 종류, 그 밖의 파일(csv·xlsx·json·zip 등 .md가 아닌 확장자)은 'file'
 export const kindOf = (name) => {
   const e = extOf(name);
-  return IMAGE.includes(e) ? 'image' : AUDIO.includes(e) ? 'audio' : VIDEO.includes(e) ? 'video' : PDF.includes(e) ? 'pdf' : null;
+  if (IMAGE.includes(e)) return 'image';
+  if (AUDIO.includes(e)) return 'audio';
+  if (VIDEO.includes(e)) return 'video';
+  if (PDF.includes(e)) return 'pdf';
+  return e && e !== 'md' && /\.[A-Za-z0-9]{1,8}$/.test(String(name || '')) ? 'file' : null;
 };
-// 노트가 아니라 첨부 파일을 가리키는 이름인가 ([[x.png]] 처럼 확장자가 첨부 형식)
+// 바로 보여 주는 형식인가 (이 경우는 파일이 없어도 노트 링크로 치지 않는다)
+export const isMediaName = (name) => { const k = kindOf(name); return k !== null && k !== 'file'; };
+// 파일 이름처럼 생겼나. 'file' 종류는 [[Node.js]] 같은 노트 제목과 헷갈릴 수 있어서 실제 파일이 있을 때만 파일로 친다
 export const isAttachmentName = (name) => kindOf(name) !== null;
 
 const MIME = {
@@ -69,6 +76,13 @@ export function renderAttachment(container, name, file, urlOf, alias) {
     urlOf(file).then((u) => { el.src = u; }, () => { container.classList.add('is-unresolved'); container.textContent = `"${name}"을(를) 불러오지 못했습니다`; });
     return el;
   };
+  if (kind === 'file') {
+    const a = Object.assign(document.createElement('a'), { className: 'attachment-file', href: '#', title: '클릭하면 내려받습니다' });
+    a.textContent = `📎 ${name}${file.size != null ? ` · ${fmtBytes(file.size)}` : ''}`;
+    a.addEventListener('click', (e) => { e.preventDefault(); urlOf(file).then((u) => window.open(u, '_blank', 'noopener')); });
+    container.append(a);
+    return;
+  }
   if (kind === 'image') sized(slot('img', { alt: size ? '' : alias || name, className: 'attachment-image', loading: 'lazy' }));
   else if (kind === 'audio') slot('audio', { controls: true, className: 'attachment-audio' });
   else if (kind === 'video') sized(slot('video', { controls: true, className: 'attachment-video' }));

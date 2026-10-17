@@ -12,7 +12,7 @@ import {
 } from './vendor.js';
 import { renderInto, sectionOf } from './render.js';
 import { parseFrontmatter, serializeFrontmatter, renderProps } from './props.js';
-import { isAttachmentName, renderAttachment } from './files.js';
+import { isAttachmentName, isMediaName, renderAttachment } from './files.js';
 
 const refreshEffect = StateEffect.define();
 
@@ -350,7 +350,7 @@ function buildDecorations(view, ctx) {
       const target = m[2].trim();
       const sub = (m[3] || '').slice(1).trim();
       const resolved = !!ctx.resolve(target) || (isAttachmentName(target) && !!ctx.attachment?.(target));
-      if (m[1] && isAttachmentName(target) && !touched(s, e)) {
+      if (m[1] && (isMediaName(target) || (isAttachmentName(target) && ctx.attachment?.(target))) && !touched(s, e)) {
         decos.push(Decoration.replace({ widget: new AttachWidget(target, m[4]?.trim() || '', ctx, ctx.attachment?.(target)?.id ?? '') }).range(s, e));
         continue;
       }

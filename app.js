@@ -7,8 +7,9 @@ import { createGraph } from './graph.js';
 import { icon } from './icons.js';
 import { DEFAULT_RULES } from './wiki-rules.js';
 import { readVaultFiles, dedupe, buildZip } from './io.js';
-import { isAttachmentName, kindOf, extOf, cleanName, pastedName, availableName, mimeOf, fmtBytes, MAX_FILE_SIZE } from './files.js';
+import { isAttachmentName, isMediaName, kindOf, extOf, cleanName, pastedName, availableName, mimeOf, fmtBytes, MAX_FILE_SIZE } from './files.js';
 import { parseFrontmatter, serializeFrontmatter, renderProps } from './props.js';
+import { guideContent } from './guide.js';
 import { applyVars, mergeEntries, formatDate, DEFAULT_DATE_FORMAT, DEFAULT_TIME_FORMAT } from './templates.js';
 import { SUPABASE_URL } from './config.js';
 
@@ -152,7 +153,7 @@ function metaOf(id) {
   const c = metaCache.get(id);
   if (c && c.text === text) return c;
   const plain = stripCode(text);
-  const links = [...plain.matchAll(WIKILINK_RE)].map((m) => ({ embed: !!m[1], target: m[2].trim(), sub: (m[3] || '').slice(1).trim() })).filter((l) => !isAttachmentName(l.target)); // 첨부 파일은 노트 링크가 아님
+  const links = [...plain.matchAll(WIKILINK_RE)].map((m) => ({ embed: !!m[1], target: m[2].trim(), sub: (m[3] || '').slice(1).trim() })).filter((l) => !isFileLink(l.target)); // 첨부 파일은 노트 링크가 아님
   const meta = { text, links, keys: new Set(links.map((l) => keyOf(l.target))), tags: tagsOf(text), headings: headingsOf(text) };
   metaCache.set(id, meta);
   return meta;
@@ -393,6 +394,20 @@ function showPopover(anchor, target, sub) {
 }
 
 // ---------- 인증 ----------
+// ---------- 시작 가이드 (LLM 위키 연결 방법) ----------
+function openGuide() {
+  const m = openModal({
+    title: '시작 가이드 · LLM 위키 연결 방법',
+    cls: 'mod-wide mod-guide',
+    content: guideContent({
+      el, mcpUrl: MCP_URL, appUrl: `${location.origin}/`, copyText,
+      openAgents: () => { m.close(); openAgents(); },
+      openMembers: () => { m.close(); openMembers(); },
+    }),
+    buttons: [{ text: '닫기', onClick: (close) => close() }],
+  });
+}
+
 // ---------- 에이전트 접근 승인 (Claude Code·Codex 등이 주소만으로 연결할 때 뜨는 화면) ----------
 let consentId = null;
 
@@ -547,6 +562,8 @@ async function openVault(vault) {
   await Promise.all([loadMembers(), loadAll()]);
   subscribeRealtime();
   setupPresence();
+  // 처음 들어오면 연결 가이드를 한 번 보여 준다 (리본의 ❓ 버튼으로 언제든 다시 열 수 있다)
+  if (!loadPref('sb.guideSeen', false)) { savePref('sb.guideSeen', true); setTimeout(() => openGuide(), 700); }
   restoreWorkspace();
   for (const inv of store.invites) {
     noticeAction(`${inv.invited_by_name}님이 "${inv.vault_name}" 보관함에 초대했습니다`, '열기', () => showVaultPicker());
@@ -953,6 +970,8 @@ function revealFolder(path) {
 async function followLink(target, sub, newTab) {
   const n = resolveNote(target);
   if (n) return openNote(n.id, { newTab, sub });
+  const file = isAttachmentName(target) ? attachmentOf(target) : null;
+  if (file) { fileUrl(file).then((u) => window.open(u, '_blank', 'noopener')); return; } // 첨부 파일 링크는 파일을 연다
   // Obsidian처럼 없는 노트를 누르면 바로 만든다
   const err = validTitle(target.trim());
   if (err) return notice(err);
@@ -1355,7 +1374,8 @@ function renderEmpty(tab) {
         el('div', { class: 'empty-state-action', text: '새 노트 만들기 (Alt+N)', onclick: () => createNote() }),
         el('div', { class: 'empty-state-action', text: '노트로 이동 (Ctrl+O)', onclick: () => openSwitcher() }),
         el('div', { class: 'empty-state-action', text: '오늘의 데일리 노트 (Alt+D)', onclick: () => openDaily() }),
-        el('div', { class: 'empty-state-action', text: '그래프 뷰 (Ctrl+G)', onclick: () => openGraph() })),
+        el('div', { class: 'empty-state-action', text: '그래프 뷰 (Ctrl+G)', onclick: () => openGraph() }),
+        el('div', { class: 'empty-state-action', text: '📘 시작 가이드 · LLM 위키 연결 방법', onclick: () => openGuide() })),
       recent.length ? el('div', { class: 'empty-state-recent' },
         el('div', { class: 'empty-state-subtitle', text: '최근 노트' }),
         recent.map((n) => el('div', { class: 'empty-state-action', onclick: () => openNote(n.id) },
@@ -2057,7 +2077,7 @@ const COMMANDS = [
   { id: 'insert-template', name: '템플릿 삽입', run: () => openTemplatePicker() },
   { id: 'insert-date', name: '현재 날짜 삽입', run: () => insertNow('date') },
   { id: 'insert-time', name: '현재 시간 삽입', run: () => insertNow('time') },
-  { id: 'attach', name: '첨부 파일 추가 (이미지·PDF·오디오·비디오)', run: () => attachFiles() },
+  { id: 'attach', name: '첨부 파일 추가 (모든 파일 · 50MB까지)', run: () => attachFiles() },
   { id: 'files', name: '첨부 파일 관리', run: () => openFiles() },
   { id: 'add-props', name: '현재 노트에 속성 추가', run: () => addProperties() },
   { id: 'rename', name: '현재 노트 이름 바꾸기', hotkey: 'F2', run: () => focusTitle() },
@@ -2080,6 +2100,7 @@ const COMMANDS = [
   { id: 'theme', name: '어두운 / 밝은 테마 전환', run: () => toggleTheme() },
   { id: 'settings', name: '설정 열기', hotkey: 'Ctrl+,', run: () => openSettings() },
   { id: 'members', name: '멤버와 초대 관리', run: () => openMembers() },
+  { id: 'guide', name: '시작 가이드 (LLM 위키 연결 방법)', run: () => openGuide() },
   { id: 'agents', name: 'AI 에이전트 연결 (Claude Code · Codex · Hermes)', run: () => openAgents() },
   { id: 'wiki-setup', name: 'LLM 위키 시작하기 (규칙·index·log 만들기)', run: () => setupLlmWiki() },
   { id: 'import', name: 'Obsidian 보관함 가져오기 (폴더 선택)', run: () => importVault() },
@@ -2090,6 +2111,12 @@ const COMMANDS = [
 
 // ---------- 첨부 파일 (이미지·PDF·오디오·비디오) ----------
 const urlCache = new Map();
+
+// 이 이름은 첨부 파일을 가리키는가: 바로 보여 주는 형식은 항상, 그 밖의 파일은 실제 파일이 있고 같은 이름의 노트가 없을 때
+function isFileLink(name) {
+  if (isMediaName(name)) return true;
+  return isAttachmentName(name) && !!attachmentOf(name) && !resolveNote(name);
+}
 
 function rebuildFiles() {
   store.fileByKey = new Map([...store.files.values()].map((f) => [keyOf(f.name), f]));
@@ -2124,9 +2151,9 @@ async function loadFiles() {
 
 async function uploadFile(blob, wantedName, { folder = '' } = {}) {
   if (!canWrite()) { notice('읽기 전용 보관함입니다'); return null; }
-  if (blob.size > MAX_FILE_SIZE) { notice(`"${wantedName}" ${fmtBytes(blob.size)}: 50MB를 넘는 파일은 올릴 수 없습니다`, 5000); return null; }
+  if (blob.size > MAX_FILE_SIZE) { notice(`"${wantedName}" ${fmtBytes(blob.size)}: 50MB를 넘는 파일은 올릴 수 없습니다 (무료 저장소 한도)`, 6000); return null; }
   let name = cleanName(wantedName);
-  if (!kindOf(name)) { notice(`"${name}"은(는) 지원하지 않는 형식입니다 (이미지·오디오·비디오·PDF)`, 5000); return null; }
+  if (!kindOf(name)) { notice(`"${name}"에는 파일 확장자(.csv, .xlsx 등)가 없어 올릴 수 없습니다`, 5000); return null; }
   name = availableName(name, (n) => store.fileByKey.has(keyOf(n)));
   const id = crypto.randomUUID();
   const path = `${store.vault.id}/${id}`;
@@ -2191,9 +2218,9 @@ function openFiles() {
 }
 
 // ---------- 가져오기 · 내보내기 ----------
-function pickFiles({ folder = false } = {}) {
+function pickFiles({ folder = false, accept = null } = {}) {
   return new Promise((resolve) => {
-    const input = el('input', { type: 'file', multiple: true, accept: folder ? null : '.md', style: 'display:none' });
+    const input = el('input', { type: 'file', multiple: true, accept, style: 'display:none' });
     if (folder) input.setAttribute('webkitdirectory', '');
     input.onchange = () => { resolve([...input.files]); input.remove(); };
     document.body.append(input);
