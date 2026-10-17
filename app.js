@@ -2518,11 +2518,11 @@ codex mcp login second-brain`),
       ...(grants.length ? grants : []).map((g) => el('div', { class: 'member-row' },
         el('span', { class: 'member-dot is-pending', text: '🤖' }),
         el('div', { class: 'member-info' },
-          el('div', { class: 'member-name', text: g.client_name || g.client?.name || g.client_id }),
-          el('div', { class: 'muted small', text: `${g.created_at ? relTime(g.created_at) + ' 허용' : ''}` })),
+          el('div', { class: 'member-name', text: g.client?.name || g.client_name || g.client?.id }),
+          el('div', { class: 'muted small', text: `${g.granted_at ? relTime(g.granted_at) + ' 허용' : ''}` })),
         el('button', { class: 'small-button', text: '연결 끊기', onclick: async () => {
-          if (!(await confirmModal({ title: '연결 끊기', text: `"${g.client_name || g.client_id}"의 접근을 끊을까요? 이 에이전트는 다시 로그인·허용해야 연결됩니다.`, okText: '끊기', danger: true }))) return;
-          const r = await sb.auth.oauth.revokeGrant(g.client_id);
+          if (!(await confirmModal({ title: '연결 끊기', text: `"${g.client?.name || g.client?.id}"의 접근을 끊을까요? 이 에이전트는 다시 로그인·허용해야 연결됩니다.`, okText: '끊기', danger: true }))) return;
+          const r = await sb.auth.oauth.revokeGrant(g.client?.id);
           if (r.error) return notice('끊지 못했습니다');
           draw();
         } }))),
