@@ -11,7 +11,7 @@ const sb = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SE
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
-const SERVER = { name: 'second-brain', version: '1.2.0' };
+const SERVER = { name: 'second-brain', version: '1.3.0' };
 const PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const COLS = 'id,title,folder,content,version,link_keys,updated_at,updated_by,updated_via,created_at';
 const RULES_TITLES = ['agents', '위키 규칙', '규칙'];
@@ -59,7 +59,7 @@ const DEFAULT_RULES = `# LLM 위키 규칙 (기본값)
 - 고치기 전에 \`read_note\`로 version을 확인하고 \`expected_version\`을 넘깁니다. (다른 사람이 먼저 고쳤으면 실패하니 다시 읽고 합칩니다.)
 - 사람이 쓴 문장은 함부로 지우지 않습니다. 고칠 때는 덧붙이거나 다듬습니다.
 - 링크는 제목만 씁니다: [[페이지 제목]], [[페이지 제목#소제목]], [[페이지 제목|보이는 글자]]
-- 속성(맨 위 YAML)은 \`get_properties\`/\`set_properties\`, 첨부 파일은 \`list_attachments\`/\`add_attachment\`, 템플릿은 \`list_templates\`/\`create_from_template\` 도구를 씁니다.
+- 속성(맨 위 YAML)은 \`get_properties\`/\`set_properties\`, 첨부 파일은 \`list_attachments\`/\`add_attachment\`, 템플릿은 \`list_templates\`/\`create_from_template\` 도구를 씁니다. CSV·엑셀·JSON·ZIP 같은 로우 데이터도 첨부로 보관하고(10MB 넘으면 \`create_upload_url\`, 최대 50MB), 노트에는 요약·분석을 쓰고 원본은 ![[파일이름]] 으로 연결합니다.
 - 한국어로 씁니다.
 `;
 
@@ -184,6 +184,13 @@ function entryFromValue(key: string, v: unknown) {
 
 const entryToJson = (e: any) => (e.type === 'raw' ? { key: e.key || '(원문)', type: 'raw', value: e.lines.join('\n') } : { key: e.key, type: e.type, value: e.type === 'number' ? Number(e.value) : e.value });
 
+async function fileNames(ctx: Ctx) {
+  const { data } = await sb.from('brain_files').select('name').eq('vault_id', ctx.vaultId);
+  return new Set((data || []).map((f) => keyOf(f.name)));
+}
+const MAX_FILE = 50 * 1024 * 1024; // 무료 저장소 한도(파일당 50MB). 요금제를 올리면 앱·DB 한도와 함께 올린다
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 async function templateNotes(ctx: Ctx, folderArg?: unknown) {
   const notes = await allNotes(ctx, 'title,folder,content');
   const given = folderArg === undefined ? '' : normFolder(folderArg);
@@ -304,7 +311,7 @@ const TOOLS = [
   },
   {
     name: 'list_attachments',
-    description: '첨부 파일(이미지·PDF·오디오·비디오) 목록. 노트에서는 ![[파일이름.png]] 로 넣습니다.',
+    description: '첨부 파일 목록(이미지·PDF·오디오·비디오뿐 아니라 CSV·엑셀·JSON·ZIP 같은 로우 데이터도). 노트에서는 ![[파일이름.csv]] 로 넣습니다.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -315,12 +322,23 @@ const TOOLS = [
   {
     name: 'add_attachment',
     description:
-      '첨부 파일을 올립니다(10MB까지). data_base64에 파일 내용을 base64로 넣으세요. 이미지 bmp png jpg jpeg gif svg webp avif / 오디오 mp3 wav m4a flac ogg opus / 비디오 mp4 webm mov mkv / pdf만 가능. 같은 이름이 있으면 "이름 1.png"처럼 번호가 붙습니다. 올린 뒤 노트에 ![[이름]] 을 넣으면 보입니다.',
+      '작은 첨부 파일(10MB까지)을 올립니다. data_base64에 파일 내용을 base64로 넣으세요. 모든 파일 형식 가능(확장자 필요). 10MB를 넘으면 create_upload_url을 쓰세요. 같은 이름이 있으면 "이름 1.csv"처럼 번호가 붙습니다. 올린 뒤 노트에 ![[이름]] 을 넣으면 보입니다.',
     inputSchema: {
       type: 'object',
       properties: { name: { type: 'string' }, data_base64: { type: 'string' }, folder: { type: 'string' } },
       required: ['name', 'data_base64'],
     },
+  },
+  {
+    name: 'create_upload_url',
+    description:
+      '큰 파일(최대 50MB, 모든 형식)을 올리기 위한 1회용 업로드 주소를 만듭니다. 1) 이 도구로 주소를 받고 2) 터미널에서 curl -X PUT -H "Content-Type: <mime>" --data-binary @파일 "<upload_url>" 로 올린 뒤 3) finish_upload로 등록하세요. CSV·엑셀·JSON·ZIP 같은 로우 데이터에 씁니다.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string', description: '예: 2026-매출.csv' }, folder: { type: 'string' } }, required: ['name'] },
+  },
+  {
+    name: 'finish_upload',
+    description: 'create_upload_url로 올린 파일을 보관함에 등록합니다. create_upload_url이 알려 준 file_id와 name을 그대로 넣으세요. 등록 뒤 노트에 ![[name]] 을 넣으면 됩니다.',
+    inputSchema: { type: 'object', properties: { file_id: { type: 'string' }, name: { type: 'string' }, folder: { type: 'string' } }, required: ['file_id', 'name'] },
   },
 ];
 
@@ -371,7 +389,7 @@ async function callTool(ctx: Ctx, name: string, a: any): Promise<string> {
       const n = await findNote(ctx, String(a.title || ''));
       if (!n) throw new ToolError(`"${a.title}" 노트가 없습니다. list_notes나 search_notes로 제목을 확인하세요.`);
       const [names, all] = await Promise.all([memberNames(ctx), allNotes(ctx, 'title,link_keys')]);
-      const exists = new Set(all.map((x) => keyOf(x.title)));
+      const exists = new Set([...all.map((x) => keyOf(x.title)), ...(await fileNames(ctx))]);
       const outs = [...new Set(linksIn(n.content))];
       const backs = all.filter((x) => (x.link_keys || []).includes(keyOf(n.title)) && keyOf(x.title) !== keyOf(n.title)).map((x) => x.title);
       return [
@@ -478,7 +496,7 @@ async function callTool(ctx: Ctx, name: string, a: any): Promise<string> {
     case 'find_problems': {
       const folder = normFolder(a.folder);
       const notes = await allNotes(ctx, 'title,folder,content,link_keys');
-      const exists = new Set(notes.map((n) => keyOf(n.title)));
+      const exists = new Set([...notes.map((n) => keyOf(n.title)), ...(await fileNames(ctx))]); // 첨부 파일 이름도 "있는 것"
       const inbound = new Map<string, number>();
       for (const n of notes) for (const k of n.link_keys || []) inbound.set(k, (inbound.get(k) || 0) + 1);
       const scope = folder ? notes.filter((n) => n.folder === folder || n.folder.startsWith(folder + '/')) : notes;
@@ -563,7 +581,7 @@ async function callTool(ctx: Ctx, name: string, a: any): Promise<string> {
     case 'add_attachment': {
       requireWrite(ctx);
       const wanted = cleanName(String(a.name || ''));
-      if (!kindOf(wanted)) throw new ToolError(`"${wanted}"은(는) 지원하지 않는 형식입니다 (이미지·오디오·비디오·PDF).`);
+      if (!kindOf(wanted)) throw new ToolError(`"${wanted}"에는 파일 확장자(.csv, .xlsx 등)가 없어 올릴 수 없습니다.`);
       let bytes: Uint8Array;
       try { bytes = Uint8Array.from(atob(String(a.data_base64 || '').replace(/^data:[^,]*,/, '').replace(/\s/g, '')), (c) => c.charCodeAt(0)); }
       catch { throw new ToolError('data_base64가 올바른 base64가 아닙니다.'); }
@@ -580,6 +598,49 @@ async function callTool(ctx: Ctx, name: string, a: any): Promise<string> {
       const { error } = await sb.from('brain_files').insert({ id, vault_id: ctx.vaultId, name, folder, mime: mimeOf(name), size: bytes.length, created_by: ctx.userId });
       if (error) { await sb.storage.from('brain-files').remove([`${ctx.vaultId}/${id}`]); throw new ToolError(error.message); }
       return `올렸습니다: "${name}" (${bytes.length}바이트). 노트에 ![[${name}]] 를 넣으면 보입니다.`;
+    }
+
+    case 'create_upload_url': {
+      requireWrite(ctx);
+      const wanted = cleanName(String(a.name || ''));
+      if (!kindOf(wanted)) throw new ToolError(`"${wanted}"에는 파일 확장자(.csv, .xlsx 등)가 없어 올릴 수 없습니다.`);
+      const folder = a.folder === undefined ? '' : normFolder(a.folder);
+      if (folder && BAD_FOLDER.test(folder)) throw new ToolError('폴더 이름에는 [ ] | # ^ \\ 를 쓸 수 없습니다.');
+      const taken = await fileNames(ctx);
+      const name = availableName(wanted, (n: string) => taken.has(keyOf(n)));
+      const id = crypto.randomUUID();
+      const { data, error } = await sb.storage.from('brain-files').createSignedUploadUrl(`${ctx.vaultId}/${id}`);
+      if (error || !data) throw new ToolError(`업로드 주소를 만들지 못했습니다: ${error?.message || ''}`);
+      return [
+        `업로드 주소를 만들었습니다. 최대 ${MAX_FILE / 1024 / 1024}MB, 2시간 안에 올리세요.`,
+        `file_id: ${id}`,
+        `name: ${name}`,
+        `upload_url: ${data.signedUrl}`,
+        '',
+        `1) 터미널에서 올리기: curl -X PUT -H "Content-Type: ${mimeOf(name)}" --data-binary @파일경로 "${data.signedUrl}"`,
+        `2) 올린 뒤 finish_upload(file_id: "${id}", name: "${name}"${folder ? `, folder: "${folder}"` : ''}) 를 호출해 등록하세요.`,
+      ].join('\n');
+    }
+
+    case 'finish_upload': {
+      requireWrite(ctx);
+      const id = String(a.file_id || '');
+      if (!UUID_RE.test(id)) throw new ToolError('file_id가 올바르지 않습니다. create_upload_url이 알려 준 값을 그대로 넣으세요.');
+      const wanted = cleanName(String(a.name || ''));
+      if (!kindOf(wanted)) throw new ToolError(`"${wanted}"에는 파일 확장자가 없습니다.`);
+      const folder = a.folder === undefined ? '' : normFolder(a.folder);
+      const { data: objs, error: le } = await sb.storage.from('brain-files').list(ctx.vaultId, { search: id, limit: 5 });
+      if (le) throw new ToolError(le.message);
+      const obj = (objs || []).find((o: any) => o.name === id);
+      if (!obj) throw new ToolError('올린 파일을 찾지 못했습니다. upload_url로 파일을 먼저 올린 뒤(2시간 안에) 다시 호출하세요.');
+      const size = Number((obj as any).metadata?.size ?? (obj as any).metadata?.contentLength ?? 0);
+      if (!size) throw new ToolError('올린 파일이 비어 있습니다.');
+      if (size > MAX_FILE) { await sb.storage.from('brain-files').remove([`${ctx.vaultId}/${id}`]); throw new ToolError('50MB를 넘는 파일이라 삭제했습니다.'); }
+      const taken = await fileNames(ctx);
+      const name = availableName(wanted, (n: string) => taken.has(keyOf(n)));
+      const { error } = await sb.from('brain_files').insert({ id, vault_id: ctx.vaultId, name, folder, mime: mimeOf(name), size, created_by: ctx.userId });
+      if (error) throw new ToolError(error.message.includes('duplicate') ? '이미 등록된 파일입니다.' : error.message);
+      return `등록했습니다: "${name}" (${size}바이트). 노트에 ![[${name}]] 를 넣으면 보입니다.`;
     }
   }
   throw new ToolError(`알 수 없는 도구: ${name}`);

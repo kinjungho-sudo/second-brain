@@ -1,4 +1,4 @@
-// [자동 생성] 앱의 templates.js 복사본. 직접 고치지 말고 build-mcp-modules.py 로 다시 만든다.
+// [자동 생성] 앱의 templates.js 에서 화면(브라우저) 코드를 뺀 서버용 복사본. 직접 고치지 말고 build-mcp-modules.py 로 다시 만든다.
 // 템플릿: Obsidian "템플릿" 코어 플러그인과 같은 규칙 (Obsidian app.js 확인)
 //  - 변수: {{title}}, {{date}}, {{time}}, {{date:형식}}, {{time:형식}} (대소문자 무시). 기본 형식 YYYY-MM-DD / HH:mm
 //  - 커서가 문서 맨 앞이면 템플릿 전체를 넣고, 아니면 본문만 넣고 템플릿의 속성은 노트 속성에 합친다
