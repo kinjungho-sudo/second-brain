@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="robots" content="noindex, nofollow" />
   <meta name="color-scheme" content="dark light" />
+  <base href="/" />
   <title>Second Brain</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -18,6 +19,11 @@
       <p class="card-desc">메모를 [[링크]]로 이어 지식망을 만들고,<br />초대한 사람과 실시간으로 함께 키웁니다.</p>
       <button id="btn-login" class="mod-cta">Google로 로그인</button>
     </div>
+  </section>
+
+  <!-- 에이전트 접근 승인 (MCP 로그인 연결) -->
+  <section id="view-consent" class="center-view" hidden>
+    <div class="card" id="consent-card"></div>
   </section>
 
   <!-- 보관함 고르기 (Obsidian의 보관함 관리 화면) -->

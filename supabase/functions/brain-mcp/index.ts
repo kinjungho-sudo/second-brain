@@ -11,7 +11,7 @@ const sb = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SE
   auth: { persistSession: false, autoRefreshToken: false },
 });
 
-const SERVER = { name: 'second-brain', version: '1.1.0' };
+const SERVER = { name: 'second-brain', version: '1.2.0' };
 const PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 const COLS = 'id,title,folder,content,version,link_keys,updated_at,updated_by,updated_via,created_at';
 const RULES_TITLES = ['agents', '위키 규칙', '규칙'];
@@ -79,12 +79,21 @@ const normFolder = (f: unknown) => String(f ?? '').trim().replace(/^\/+|\/+$/g, 
 
 class ToolError extends Error {}
 
-type Ctx = { tokenId: string; vaultId: string; vaultName: string; userId: string; userName: string; role: string; via: string };
+type Ctx = { tokenId: string; vaultId: string; vaultName: string; userId: string; userName: string; role: string; via: string; vaults?: { name: string; role: string }[] };
+// 접속한 주체: 열쇠(보관함 1개 고정) 또는 구글 로그인(OAuth, 여러 보관함 중 선택)
+type Principal = { ctx?: Ctx; userId?: string; userName?: string };
 
-async function authenticate(req: Request): Promise<Ctx | null> {
+async function authenticate(req: Request): Promise<Principal | null> {
   const auth = req.headers.get('authorization') || '';
   const token = auth.replace(/^Bearer\s+/i, '').trim();
-  if (!token.startsWith('sbw_')) return null;
+  if (!token) return null;
+  if (!token.startsWith('sbw_')) {
+    // 구글 로그인(OAuth)으로 받은 Supabase 로그인 토큰
+    const { data, error } = await sb.auth.getUser(token);
+    if (error || !data?.user) return null;
+    const { data: p } = await sb.from('brain_profiles').select('display_name').eq('user_id', data.user.id).maybeSingle();
+    return { userId: data.user.id, userName: p?.display_name || data.user.email || '알 수 없음' };
+  }
   const { data: t } = await sb.from('brain_agent_tokens').select('id,vault_id,user_id,name,revoked_at').eq('token_hash', await sha256(token)).maybeSingle();
   if (!t || t.revoked_at) return null;
   const [{ data: m }, { data: v }, { data: p }] = await Promise.all([
@@ -94,7 +103,30 @@ async function authenticate(req: Request): Promise<Ctx | null> {
   ]);
   if (!m || !v) return null;
   sb.from('brain_agent_tokens').update({ last_used_at: new Date().toISOString() }).eq('id', t.id).then(() => {});
-  return { tokenId: t.id, vaultId: t.vault_id, vaultName: v.name, userId: t.user_id, userName: p?.display_name || '알 수 없음', role: m.role, via: t.name };
+  return { ctx: { tokenId: t.id, vaultId: t.vault_id, vaultName: v.name, userId: t.user_id, userName: p?.display_name || '알 수 없음', role: m.role, via: t.name } };
+}
+
+async function userVaults(userId: string) {
+  const { data: ms } = await sb.from('brain_members').select('vault_id,role').eq('user_id', userId).is('removed_at', null);
+  const ids = (ms || []).map((m) => m.vault_id);
+  if (!ids.length) return [];
+  const { data: vs } = await sb.from('brain_vaults').select('id,name,created_at,created_by').in('id', ids).is('archived_at', null);
+  return (vs || []).map((v) => ({ ...v, role: (ms || []).find((m) => m.vault_id === v.id)!.role as string }))
+    .sort((a, b) => a.created_at.localeCompare(b.created_at));
+}
+
+// 이번 호출에 쓸 보관함을 정한다. 로그인 연결은 vault 값(이름)으로 고르고, 없으면 내가 만든 가장 오래된 보관함.
+async function ctxFor(pr: Principal, vaultArg?: unknown): Promise<Ctx> {
+  const want = vaultArg === undefined || vaultArg === null || vaultArg === '' ? '' : String(vaultArg);
+  if (pr.ctx) {
+    if (want && want !== pr.ctx.vaultId && keyOf(want) !== keyOf(pr.ctx.vaultName)) throw new ToolError(`이 열쇠는 "${pr.ctx.vaultName}" 보관함 전용입니다.`);
+    return pr.ctx;
+  }
+  const vs = await userVaults(pr.userId!);
+  if (!vs.length) throw new ToolError('접근할 수 있는 보관함이 없습니다. 앱에서 보관함을 만들거나 초대를 수락하세요.');
+  const v = want ? vs.find((x) => x.id === want || keyOf(x.name) === keyOf(want)) : (vs.find((x) => x.created_by === pr.userId && x.role === 'owner') || vs[0]);
+  if (!v) throw new ToolError(`"${want}" 보관함을 찾을 수 없습니다. list_vaults로 확인하세요.`);
+  return { tokenId: 'oauth', vaultId: v.id, vaultName: v.name, userId: pr.userId!, userName: pr.userName || '알 수 없음', role: v.role, via: '로그인 연결', vaults: vs.map((x) => ({ name: x.name, role: x.role })) };
 }
 
 function requireWrite(ctx: Ctx) {
@@ -292,6 +324,14 @@ const TOOLS = [
   },
 ];
 
+// 모든 도구에 선택 인자 vault(보관함 이름)를 붙인다. 로그인 연결에서 보관함이 여러 개일 때 쓴다.
+for (const t of TOOLS) (t.inputSchema as any).properties.vault = { type: 'string', description: '(선택) 보관함 이름. 보관함이 여러 개일 때만. list_vaults로 확인' };
+TOOLS.push({
+  name: 'list_vaults',
+  description: '내가 쓸 수 있는 보관함 목록(이름, 권한). 여러 보관함(개인·팀)이 있을 때 다른 도구의 vault 값을 정하는 데 씁니다.',
+  inputSchema: { type: 'object', properties: {} },
+} as any);
+
 async function callTool(ctx: Ctx, name: string, a: any): Promise<string> {
   switch (name) {
     case 'wiki_guide': {
@@ -303,6 +343,7 @@ async function callTool(ctx: Ctx, name: string, a: any): Promise<string> {
       return [
         `# 보관함 "${ctx.vaultName}"`,
         `- 연결: ${ctx.userName}님의 열쇠 "${ctx.via}" · 권한: ${ctx.role === 'viewer' ? '읽기 전용' : ctx.role === 'owner' ? '소유자' : '편집자'}`,
+        ...(ctx.vaults && ctx.vaults.length > 1 ? [`- 내가 쓸 수 있는 보관함: ${ctx.vaults.map((v) => `${v.name}(${v.role === 'viewer' ? '읽기 전용' : v.role === 'owner' ? '소유자' : '편집자'})`).join(', ')} · 지금은 "${ctx.vaultName}". 다른 보관함은 도구마다 vault 값(이름)을 주면 됩니다.`] : []),
         `- 노트 ${notes.length}개`,
         `- 폴더: ${[...folders.entries()].map(([f, c]) => `${f}(${c})`).join(', ') || '없음'}`,
         `- index 노트: ${notes.some((n) => keyOf(n.title) === 'index') ? '있음' : '없음'} · log 노트: ${notes.some((n) => keyOf(n.title) === 'log') ? '있음' : '없음'}`,
@@ -545,7 +586,7 @@ async function callTool(ctx: Ctx, name: string, a: any): Promise<string> {
 }
 
 // ---------- JSON-RPC ----------
-async function handle(ctx: Ctx, msg: any) {
+async function handle(pr: Principal, msg: any) {
   const { id, method, params } = msg;
   const ok = (result: unknown) => ({ jsonrpc: '2.0', id, result });
   const fail = (code: number, message: string) => ({ jsonrpc: '2.0', id, error: { code, message } });
@@ -556,7 +597,9 @@ async function handle(ctx: Ctx, msg: any) {
         protocolVersion: PROTOCOLS.includes(asked) ? asked : PROTOCOLS[0],
         capabilities: { tools: { listChanged: false } },
         serverInfo: SERVER,
-        instructions: `Second Brain 보관함 "${ctx.vaultName}"에 연결되었습니다. 작업 전에 반드시 wiki_guide를 먼저 호출해 규칙을 읽으세요.`,
+        instructions: pr.ctx
+          ? `Second Brain 보관함 "${pr.ctx.vaultName}"에 연결되었습니다. 작업 전에 반드시 wiki_guide를 먼저 호출해 규칙을 읽으세요.`
+          : `Second Brain에 ${pr.userName}님 계정으로 연결되었습니다. 작업 전에 반드시 wiki_guide를 먼저 호출해 규칙을 읽으세요. 보관함이 여러 개면 list_vaults로 확인하고 도구의 vault 값으로 고르세요.`,
       });
     }
     case 'ping':
@@ -565,7 +608,14 @@ async function handle(ctx: Ctx, msg: any) {
       return ok({ tools: TOOLS });
     case 'tools/call': {
       try {
-        const text = await callTool(ctx, params?.name, params?.arguments || {});
+        let text: string;
+        if (params?.name === 'list_vaults') {
+          const vs = pr.ctx ? [{ name: pr.ctx.vaultName, role: pr.ctx.role }] : await userVaults(pr.userId!);
+          text = `보관함 ${vs.length}개\n${vs.map((v) => `- ${v.name} · ${v.role === 'viewer' ? '읽기 전용' : v.role === 'owner' ? '소유자' : '편집자'}`).join('\n') || '(없음)'}`;
+        } else {
+          const ctx = await ctxFor(pr, params?.arguments?.vault);
+          text = await callTool(ctx, params?.name, params?.arguments || {});
+        }
         return ok({ content: [{ type: 'text', text }] });
       } catch (e) {
         const message = e instanceof ToolError ? e.message : `서버 오류: ${(e as Error).message}`;
@@ -582,13 +632,23 @@ async function handle(ctx: Ctx, msg: any) {
   }
 }
 
+const SELF = `${Deno.env.get('SUPABASE_URL')}/functions/v1/brain-mcp`;
+const META_URL = `${SELF}/.well-known/oauth-protected-resource`;
+
 Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
+  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: { ...CORS, 'Access-Control-Expose-Headers': 'WWW-Authenticate' } });
   if (req.method === 'DELETE') return new Response(null, { status: 200, headers: CORS });
+  // MCP 로그인(OAuth) 안내문: 이 서버의 로그인은 Supabase Auth가 맡는다
+  if (req.method === 'GET' && new URL(req.url).pathname.includes('/.well-known/oauth-protected-resource')) {
+    return json({ resource: SELF, authorization_servers: [`${Deno.env.get('SUPABASE_URL')}/auth/v1`], bearer_methods_supported: ['header'], resource_name: 'Second Brain' });
+  }
   if (req.method !== 'POST') return json({ error: 'POST로 MCP 요청을 보내세요.' }, 405, { Allow: 'POST' });
 
-  const ctx = await authenticate(req);
-  if (!ctx) return json({ jsonrpc: '2.0', id: null, error: { code: -32001, message: '에이전트 열쇠가 없거나 취소되었습니다. 앱의 설정 → AI 에이전트 연결에서 확인하세요.' } }, 401);
+  const pr = await authenticate(req);
+  if (!pr) {
+    return json({ jsonrpc: '2.0', id: null, error: { code: -32001, message: '로그인이 필요하거나 열쇠가 없거나 취소되었습니다. MCP 주소만 넣고 로그인하거나, 앱의 설정 → AI 에이전트 연결에서 열쇠를 만드세요.' } }, 401,
+      { 'WWW-Authenticate': `Bearer resource_metadata="${META_URL}"`, 'Access-Control-Expose-Headers': 'WWW-Authenticate' });
+  }
 
   let body: any;
   try { body = await req.json(); } catch { return json({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }, 400); }
@@ -597,7 +657,7 @@ Deno.serve(async (req) => {
   const replies = [];
   for (const m of msgs) {
     if (m?.id === undefined || m?.id === null) continue; // 알림(notifications/*)은 답하지 않는다
-    replies.push(await handle(ctx, m));
+    replies.push(await handle(pr, m));
   }
   if (!replies.length) return new Response(null, { status: 202, headers: CORS });
   return json(batch ? replies : replies[0]);

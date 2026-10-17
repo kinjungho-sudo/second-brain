@@ -22,14 +22,20 @@ second-brain은 단독 앱이 아니라 **CoMindWorks "AI 에이전트 오피스
 - **API 키 불필요**: 앱에는 LLM이 없다. 에이전트(Claude Code·Codex CLI 등)가 자기 구독(예: ChatGPT 요금제 로그인)으로 돌고, 보관함 열쇠(`sbw_…`)만으로 접속한다.
 - 검증: Codex CLI(ChatGPT 로그인)로 `list_attachments` 실호출 성공 (`bearer_token_env_var` + `default_tools_approval_mode="approve"`).
 
+## 로그인(OAuth) 연결 — brain-mcp v4 (2026-10-17)
+- 에이전트에 주소만 넣으면 브라우저가 열리고 구글 로그인 → "허용" → 연결. 열쇠 복사 불필요.
+- 구조: MCP 서버가 `WWW-Authenticate: Bearer resource_metadata=…` 로 안내 → Supabase Auth(OAuth 2.1, PKCE, 동적 클라이언트 등록)가 로그인·토큰 발급 → 앱의 `/oauth/consent` 화면에서 사용자가 허용 → 서버가 로그인 토큰으로 사용자를 확인.
+- 보관함이 여러 개면 `list_vaults`, 각 도구의 `vault`(이름)로 고른다. 기본은 내가 만든 가장 오래된 보관함. (재한님은 자기 계정으로 로그인하면 자기 보관함, 공용 보관함은 멤버로 초대하면 같은 방식으로 보임)
+- 열쇠 방식은 서버·자동화용으로 남겨 둠.
+- **Supabase 대시보드 설정 필요**: Authentication → OAuth Server → 켜기, Authorization Path `/oauth/consent`, Allow Dynamic OAuth Apps 켜기.
+
 ## 아직 안 된 것 (연동 빚)
 | 항목 | 내용 |
 |---|---|
-| 보관함 여러 개 | 열쇠 1개 = 보관함 1개. 오피스에서 여러 보관함·팀을 쓰려면 보관함 목록·전환 도구 필요 |
-| 로그인 방식 | 지금은 열쇠 붙여넣기. 직원 단위로는 OAuth(구글 로그인) 방식이 맞음 |
 | 이벤트 | 에이전트가 변경을 구독(웹훅)하는 기능 없음 |
 | 큰 파일 | 에이전트 업로드는 10MB까지(앱은 50MB). 더 크면 업로드 주소 방식 필요 |
 | 템플릿 폴더 | 앱은 사용자별 설정, MCP는 Templates/템플릿 폴더 규칙. 보관함 공통 설정으로 통일 필요 |
+| 접근 범위 | OAuth 토큰은 사용자 전체 권한(Supabase 사용자 정의 scope 미지원). 앱의 "연결된 에이전트"에서 끊을 수 있음 |
 
 ## 새 기능을 만들 때 체크
 1. 에이전트도 이 기능을 써야 하는가? → 그렇다면 MCP 도구를 같이 설계

@@ -393,10 +393,57 @@ function showPopover(anchor, target, sub) {
 }
 
 // ---------- 인증 ----------
+// ---------- 에이전트 접근 승인 (Claude Code·Codex 등이 주소만으로 연결할 때 뜨는 화면) ----------
+let consentId = null;
+
+async function runConsent(id, session) {
+  showView('view-consent');
+  const card = $('consent-card');
+  const say = (...kids) => card.replaceChildren(...kids);
+  if (!session) {
+    sessionStorage.setItem('sb.afterLogin', location.href);
+    say(el('div', { class: 'card-logo', 'data-icon': 'graph' }), el('h1', { text: 'Second Brain' }),
+      el('p', { class: 'card-desc', text: 'AI 에이전트가 이 계정에 연결하려고 합니다. 먼저 로그인해 주세요.' }),
+      el('button', { class: 'mod-cta', text: 'Google로 로그인', onclick: () => sb.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: `${location.origin}/` } }) }));
+    hydrateIcons(card);
+    return;
+  }
+  const { data, error } = await sb.auth.oauth.getAuthorizationDetails(id);
+  if (error || !data) return say(el('h1', { text: '연결 요청을 열 수 없습니다' }), el('p', { class: 'card-desc', text: '요청이 만료됐거나 이미 처리됐습니다. 에이전트에서 다시 연결을 시작해 주세요.' }));
+  if (!('authorization_id' in data)) { location.replace(data.redirect_url); return; } // 이미 허용한 에이전트
+  const clientName = data.client?.name || '이름 없는 에이전트';
+  const host = (() => { try { return new URL(data.redirect_uri).host; } catch { return data.redirect_uri; } })();
+  const finish = async (approve) => {
+    card.querySelectorAll('button').forEach((b) => { b.disabled = true; });
+    const r = approve ? await sb.auth.oauth.approveAuthorization(id) : await sb.auth.oauth.denyAuthorization(id);
+    if (r.error || !r.data?.redirect_url) return say(el('h1', { text: '처리하지 못했습니다' }), el('p', { class: 'card-desc', text: r.error?.message || '다시 시도해 주세요.' }));
+    location.href = r.data.redirect_url;
+  };
+  say(el('div', { class: 'card-logo', 'data-icon': 'bot' }), el('h1', { text: 'AI 에이전트 연결 요청' }),
+    el('p', { class: 'card-desc' }, el('strong', { text: clientName }), '(', el('code', { text: host }), ')가 내 Second Brain에 연결하려고 합니다.'),
+    el('div', { class: 'consent-list' },
+      el('div', { text: `• ${store.user?.email || session.user.email} 계정의 보관함 노트를 읽고, 쓰고, 검색합니다` }),
+      el('div', { text: '• 속성·첨부 파일·템플릿도 다룹니다' }),
+      el('div', { text: '• 고친 내용은 수정 이력에 🤖로 남고 되돌릴 수 있습니다' }),
+      el('div', { text: '• 언제든 설정에서 연결을 끊을 수 있습니다' })),
+    el('div', { class: 'consent-buttons' },
+      el('button', { class: 'mod-cta', text: '허용', onclick: () => finish(true) }),
+      el('button', { text: '거부', onclick: () => finish(false) })));
+  hydrateIcons(card);
+}
+
 async function boot() {
   applySettings();
   hydrateIcons(document);
   const { data: { session } } = await sb.auth.getSession();
+  const resume = sessionStorage.getItem('sb.afterLogin');
+  if (resume && session) { sessionStorage.removeItem('sb.afterLogin'); history.replaceState(null, '', resume); }
+  consentId = location.pathname === '/oauth/consent' ? new URLSearchParams(location.search).get('authorization_id') : null;
+  if (consentId) {
+    store.user = session?.user || null;
+    sb.auth.onAuthStateChange((_event, s) => { if (s?.user && !store.user) location.reload(); });
+    return runConsent(consentId, session);
+  }
   await onSession(session);
   sb.auth.onAuthStateChange((_event, s) => {
     if ((s?.user?.id || null) !== (store.user?.id || null)) onSession(s);
@@ -507,7 +554,7 @@ async function openVault(vault) {
 }
 
 $('btn-login').onclick = () =>
-  sb.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: location.origin + location.pathname } });
+  sb.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: location.origin + '/' } });
 
 async function logout() {
   await flushAll();
@@ -2456,8 +2503,30 @@ async function openAgents() {
       draw({ name: n, token: data });
     };
     name.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) create(); });
+    const grantsRes = await sb.auth.oauth.listGrants().catch(() => ({ data: [] }));
+    const grants = Array.isArray(grantsRes?.data) ? grantsRes.data : [];
+    const easy = (title, code) => el('div', { class: 'agent-guide' }, el('div', { class: 'agent-guide-title', text: title }),
+      el('div', { class: 'agent-code' }, el('pre', { text: code }), el('button', { class: 'small-button', text: '복사', onclick: () => copyText(code) })));
 
     body.replaceChildren(...[
+      el('div', { class: 'members-section-title', text: '가장 쉬운 방법: 주소로 연결 (열쇠 없음)' }),
+      el('p', { class: 'muted small', text: '에이전트에 아래 주소만 넣으면 브라우저가 열립니다. 구글로 로그인하고 "허용"을 누르면 끝입니다. 연결된 에이전트는 로그인한 내 계정의 권한으로 동작합니다.' }),
+      easy('Claude Code (연결 후 Claude Code 안에서 /mcp → second-brain → 로그인)', `claude mcp add --transport http second-brain ${MCP_URL}`),
+      easy('Codex (ChatGPT 요금제로 로그인한 Codex CLI, API 키 불필요)', `codex mcp add second-brain --url ${MCP_URL}
+codex mcp login second-brain`),
+      el('div', { class: 'members-section-title', text: `로그인으로 연결된 에이전트 ${grants.length}개` }),
+      ...(grants.length ? grants : []).map((g) => el('div', { class: 'member-row' },
+        el('span', { class: 'member-dot is-pending', text: '🤖' }),
+        el('div', { class: 'member-info' },
+          el('div', { class: 'member-name', text: g.client_name || g.client?.name || g.client_id }),
+          el('div', { class: 'muted small', text: `${g.created_at ? relTime(g.created_at) + ' 허용' : ''}` })),
+        el('button', { class: 'small-button', text: '연결 끊기', onclick: async () => {
+          if (!(await confirmModal({ title: '연결 끊기', text: `"${g.client_name || g.client_id}"의 접근을 끊을까요? 이 에이전트는 다시 로그인·허용해야 연결됩니다.`, okText: '끊기', danger: true }))) return;
+          const r = await sb.auth.oauth.revokeGrant(g.client_id);
+          if (r.error) return notice('끊지 못했습니다');
+          draw();
+        } }))),
+      el('div', { class: 'members-section-title', text: '열쇠 방식 (서버·자동화용, 로그인할 수 없는 곳)' }),
       el('p', { class: 'muted small', text: '에이전트가 이 보관함의 노트를 읽고, 찾고, 쓰고, 링크를 정리할 수 있게 연결합니다. 에이전트가 고친 내용은 수정 이력에 🤖 표시로 남고 언제든 되돌릴 수 있습니다. 열쇠는 이 보관함에만, 만든 사람의 권한으로만 쓰입니다.' }),
       newToken ? el('div', { class: 'agent-new-token' },
         el('div', { class: 'agent-guide-title', text: `"${newToken.name}" 열쇠가 만들어졌습니다` }),
