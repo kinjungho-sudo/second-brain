@@ -451,7 +451,7 @@ async function boot() {
 }
 
 function showView(id) {
-  for (const v of ['view-login', 'view-vaults', 'view-app']) $(v).hidden = v !== id;
+  for (const v of ['view-login', 'view-consent', 'view-vaults', 'view-app']) $(v).hidden = v !== id;
 }
 
 let initialized = false;
