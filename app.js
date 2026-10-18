@@ -2477,10 +2477,17 @@ async function openMembers() {
     const invite = async () => {
       const v = email.value.trim();
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(v)) { notice('이메일 주소를 확인해 주세요'); return email.focus(); }
-      const { error } = await sb.rpc('brain_invite', { p_vault: store.vault.id, p_email: v, p_role: role.value });
+      const { data: inviteId, error } = await sb.rpc('brain_invite', { p_vault: store.vault.id, p_email: v, p_role: role.value });
       if (error) return notice(error.message.includes('already') ? '이미 이 보관함의 멤버입니다' : '초대하지 못했습니다');
-      notice(`${v} 님을 초대했습니다. 그 계정으로 로그인하면 초대가 보입니다.`, 4000);
+      email.value = '';
       draw();
+      // 초대 메일 (Resend). 실패해도 초대 자체는 이미 만들어졌다
+      const { data: mail, error: mailErr } = await sb.functions.invoke('brain-invite-mail', { body: { invite_id: inviteId } });
+      if (mail?.sent) return notice(`${v} 님을 초대하고 초대 메일을 보냈습니다.`, 4000);
+      const why = mail?.reason === 'not_configured' ? '메일 발송이 설정되지 않아 메일은 보내지 않았습니다'
+        : mail?.reason === 'resend_error' ? `메일을 보내지 못했습니다 (${mail.detail || '발송 서비스 오류'})`
+        : mailErr ? '메일을 보내지 못했습니다' : '메일은 보내지 않았습니다';
+      notice(`${v} 님을 초대했습니다. ${why}. 그 계정으로 로그인하면 초대가 보입니다.`, 6000);
     };
     email.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) invite(); });
 
