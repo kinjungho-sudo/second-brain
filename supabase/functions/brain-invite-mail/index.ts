@@ -1,6 +1,6 @@
 // 초대 메일 보내기 (Resend). 앱이 초대를 만든 직후 호출한다.
 // 로그인한 사용자의 권한으로 초대 기록을 읽기 때문에 "그 보관함의 소유자"만 메일을 보낼 수 있다.
-// 비밀 값(Supabase 함수 비밀): RESEND_API_KEY (필수), MAIL_FROM (선택, 예: "Second Brain <invite@도메인>"), APP_URL (선택)
+// 비밀 값(Supabase 함수 비밀): RESEND_API_KEY 또는 RESEND_KEY (필수), MAIL_FROM (선택, 예: "Second Brain <invite@도메인>"), APP_URL (선택)
 import { createClient } from 'npm:@supabase/supabase-js@2.45.4';
 
 const CORS = {
@@ -33,7 +33,7 @@ Deno.serve(async (req) => {
   if (Date.now() - new Date(inv.created_at).getTime() > 10 * 60 * 1000) return reply({ sent: false, reason: 'too_old' }, 400); // 방금 만든 초대만
   const { data: vault } = await sb.from('brain_vaults').select('name').eq('id', inv.vault_id).maybeSingle();
 
-  const key = Deno.env.get('RESEND_API_KEY');
+  const key = (Deno.env.get('RESEND_API_KEY') || Deno.env.get('RESEND_KEY') || '').trim();
   if (!key) {
     // 진단: 비슷한 이름의 비밀 값이 있는지 이름만 알려 준다 (값은 절대 내보내지 않음)
     const names = Object.keys(Deno.env.toObject()).filter((k) => /resend|mail|api_?key/i.test(k));
@@ -58,6 +58,7 @@ Deno.serve(async (req) => {
     body: JSON.stringify({ from, to: [inv.email], subject: `[Second Brain] ${who}님이 "${vname}" 보관함에 초대했습니다`, html }),
   });
   const out = await r.json().catch(() => ({}));
+  console.log('resend', r.status, JSON.stringify(out).slice(0, 200));
   if (!r.ok) return reply({ sent: false, reason: 'resend_error', detail: String(out?.message || r.status) }, 200);
   return reply({ sent: true, id: out?.id });
 });
