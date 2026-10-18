@@ -34,7 +34,11 @@ Deno.serve(async (req) => {
   const { data: vault } = await sb.from('brain_vaults').select('name').eq('id', inv.vault_id).maybeSingle();
 
   const key = Deno.env.get('RESEND_API_KEY');
-  if (!key) return reply({ sent: false, reason: 'not_configured' });
+  if (!key) {
+    // 진단: 비슷한 이름의 비밀 값이 있는지 이름만 알려 준다 (값은 절대 내보내지 않음)
+    const names = Object.keys(Deno.env.toObject()).filter((k) => /resend|mail|api_?key/i.test(k));
+    return reply({ sent: false, reason: 'not_configured', seen: names });
+  }
 
   const appUrl = Deno.env.get('APP_URL') || 'https://second-brain-phi-seven.vercel.app';
   const from = Deno.env.get('MAIL_FROM') || 'Second Brain <onboarding@resend.dev>';

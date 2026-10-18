@@ -2484,7 +2484,7 @@ async function openMembers() {
       // 초대 메일 (Resend). 실패해도 초대 자체는 이미 만들어졌다
       const { data: mail, error: mailErr } = await sb.functions.invoke('brain-invite-mail', { body: { invite_id: inviteId } });
       if (mail?.sent) return notice(`${v} 님을 초대하고 초대 메일을 보냈습니다.`, 4000);
-      const why = mail?.reason === 'not_configured' ? '메일 발송이 설정되지 않아 메일은 보내지 않았습니다'
+      const why = mail?.reason === 'not_configured' ? `메일 발송이 설정되지 않아 메일은 보내지 않았습니다 (함수가 본 비밀 값 이름: ${(mail.seen || []).join(', ') || '없음'})`
         : mail?.reason === 'resend_error' ? `메일을 보내지 못했습니다 (${mail.detail || '발송 서비스 오류'})`
         : mailErr ? '메일을 보내지 못했습니다' : '메일은 보내지 않았습니다';
       notice(`${v} 님을 초대했습니다. ${why}. 그 계정으로 로그인하면 초대가 보입니다.`, 6000);
